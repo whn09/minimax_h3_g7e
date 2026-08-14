@@ -1,0 +1,133 @@
+diff --git a/python/sglang/multimodal_gen/configs/sample/minimax_h3.py b/python/sglang/multimodal_gen/configs/sample/minimax_h3.py
+index 6035001834..94855b1b33 100644
+--- a/python/sglang/multimodal_gen/configs/sample/minimax_h3.py
++++ b/python/sglang/multimodal_gen/configs/sample/minimax_h3.py
+@@ -192,6 +192,11 @@ class MiniMaxH3SamplingParams(SamplingParams):
+                 for field_name in (
+                     "short_edge",
+                     "aspect_ratio",
++                    # width/height are the exact-canvas alternative to short_edge+aspect_ratio.
++                    # Without them here the projection silently drops both, and the request is
++                    # then rejected for a missing short_edge -- confusing but not dangerous.
++                    "width",
++                    "height",
+                     "duration_seconds",
+                 )
+                 if field_name in self.target
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py
+index 90c97fa81e..a98a34525f 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py
+@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
+     MINIMAX_H3_SUPPORTED_FPS,
+ )
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
++    MINIMAX_H3_CANVAS_MULTIPLE,
++    MINIMAX_H3_MAX_PIXELS,
+     minimax_h3_allowed_short_edges,
+ )
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+@@ -85,32 +87,77 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
+     # The canonical target has a deliberately small projection.  Transport
+     # compatibility keys are ignored; only these three declared values are
+     # validated and emitted below.
+-    short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
+-    allowed = minimax_h3_allowed_short_edges()
+-    if short_edge not in allowed:
+-        # Identical to the previous message when nothing is opted in, so the released
+-        # deployment's error text does not change.
+-        expected = allowed[0] if len(allowed) == 1 else f"one of {list(allowed)}"
+-        raise ValueError(
+-            f"{path}.short_edge must be {expected} for minimax_h3, got {short_edge}"
+-        )
+-    aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
+-    if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
+-        raise ValueError(
+-            f'{path}.aspect_ratio must be "auto" for task {profile.task!r}, '
+-            f"got {aspect_ratio!r}"
+-        )
+-    has_duration = target.get("duration_seconds") is not None
+-    if (
+-        profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
+-        and aspect_ratio != "auto"
+-        and aspect_ratio not in MINIMAX_H3_FINITE_ASPECT_RATIOS
+-    ):
+-        raise ValueError(
+-            f"{path}.aspect_ratio for task {profile.task!r} must be 'auto' or "
+-            f"one of {list(MINIMAX_H3_FINITE_ASPECT_RATIOS)!r}, got "
+-            f"{aspect_ratio!r}"
+-        )
++    # Geometry arrives as one of two mutually exclusive groups: width+height names an exact
++    # canvas, while the released short_edge+aspect_ratio pair names a policy ratio and keeps its
++    # original behaviour byte-for-byte, including its error messages.
++    explicit_canvas = target.get("width") is not None or target.get("height") is not None
++    if explicit_canvas:
++        if target.get("short_edge") is not None or target.get("aspect_ratio") is not None:
++            raise ValueError(
++                f"{path} accepts either width+height or short_edge+aspect_ratio, not both"
++            )
++        if profile.aspect_ratio_forced_auto:
++            raise ValueError(
++                f"{path}.width/height are not allowed for task {profile.task!r}, which "
++                'requires aspect_ratio "auto"'
++            )
++        width = _require_int(target.get("width"), f"{path}.width")
++        height = _require_int(target.get("height"), f"{path}.height")
++        for field_name, value in (("width", width), ("height", height)):
++            if value <= 0 or value % MINIMAX_H3_CANVAS_MULTIPLE:
++                # Refuse rather than round. This is the same rule the short-edge allowlist
++                # states: a request that silently changes geometry is worse than one refused.
++                raise ValueError(
++                    f"{path}.{field_name} must be a positive multiple of "
++                    f"{MINIMAX_H3_CANVAS_MULTIPLE}, got {value}"
++                )
++        if width * height > MINIMAX_H3_MAX_PIXELS:
++            # The resolver's soft area cap would scale an oversized canvas down. That is right
++            # for a ratio request but wrong for an exact one, so refuse instead.
++            raise ValueError(
++                f"{path}.width*height must be at most {MINIMAX_H3_MAX_PIXELS} px, got "
++                f"{width * height} for {width}x{height}"
++            )
++        short_edge = min(width, height)
++        allowed = minimax_h3_allowed_short_edges()
++        if short_edge not in allowed:
++            expected = allowed[0] if len(allowed) == 1 else f"one of {list(allowed)}"
++            raise ValueError(
++                f"{path}: min(width, height) is the short edge and must be {expected} for "
++                f"minimax_h3, got {short_edge} from {width}x{height}"
++            )
++        # An exact canvas bypasses the finite-ratio allowlist on purpose: that list constrains
++        # *ratio* requests to tested shapes, and a caller naming both axes has already chosen.
++        # The resolver still enforces the inclusive 1:4..4:1 range on the derived ratio.
++        aspect_ratio = f"{width}:{height}"
++        has_duration = target.get("duration_seconds") is not None
++    else:
++        short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
++        allowed = minimax_h3_allowed_short_edges()
++        if short_edge not in allowed:
++            # Identical to the previous message when nothing is opted in, so the released
++            # deployment's error text does not change.
++            expected = allowed[0] if len(allowed) == 1 else f"one of {list(allowed)}"
++            raise ValueError(
++                f"{path}.short_edge must be {expected} for minimax_h3, got {short_edge}"
++            )
++        aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
++        if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
++            raise ValueError(
++                f'{path}.aspect_ratio must be "auto" for task {profile.task!r}, '
++                f"got {aspect_ratio!r}"
++            )
++        has_duration = target.get("duration_seconds") is not None
++        if (
++            profile.task in {MINIMAX_H3_TASK_T2VA, MINIMAX_H3_TASK_REF2VA}
++            and aspect_ratio != "auto"
++            and aspect_ratio not in MINIMAX_H3_FINITE_ASPECT_RATIOS
++        ):
++            raise ValueError(
++                f"{path}.aspect_ratio for task {profile.task!r} must be 'auto' or "
++                f"one of {list(MINIMAX_H3_FINITE_ASPECT_RATIOS)!r}, got "
++                f"{aspect_ratio!r}"
++            )
+     if not has_duration:
+         if not profile.duration_from_audio_reference:
+             raise ValueError(f"{path}.duration_seconds is required")

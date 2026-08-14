@@ -1,0 +1,18 @@
+# 成片和权重不进库
+*.mp4
+*.png
+*.jpg
+*.wav
+*.safetensors
+# scripts/assets/ 下逐个放行：那几个 fixture 是我们自己生成的 t2va 片子切出来的。
+# 这里是白名单而不是 !scripts/assets/*，这样往那个目录里丢的任何别的素材默认都不会进库。
+!scripts/assets/first.png
+!scripts/assets/last.png
+!scripts/assets/ref.mp4
+!scripts/assets/ref5s.mp4
+!scripts/assets/refaudio.wav
+# Run artifacts
+*.log
+*_status.json
+.DS_Store
+__pycache__/

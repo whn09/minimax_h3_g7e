@@ -1,0 +1,172 @@
+Subject: [PATCH] MiniMax-H3: allow opt-in non-768 short edges
+
+The shape resolver (`minimax_h3_resolve_spatial_shape`) is already fully
+parametric in `base_short_edge` -- nominal short edge x aspect ratio, soft
+768x1344 area cap, then nearest-32px per axis. The 768-only restriction lives
+entirely in two validators, so widening it is a policy change rather than a
+math change.
+
+`SGLANG_MINIMAX_H3_EXTRA_SHORT_EDGES` (comma-separated, must be positive
+multiples of 32) adds accepted short edges. Unset -- the default -- leaves the
+released behaviour and both error messages byte-for-byte unchanged.
+
+  SGLANG_MINIMAX_H3_EXTRA_SHORT_EDGES=480  ->  target.short_edge 480, 16:9
+                                               resolves to 864x480
+
+Caveat this does not remove: H3-Base is released as a 768px model, every
+official example requests 768, and there is no published non-768 reference
+output. A deployment setting this validates the output itself. `quality:"high"`
+stays gated to the audited 1344x768/124-frame/50-step workload and will still
+refuse a non-768 request (release_metadata.py, unchanged here).
+
+Third hunk (prequeue.py) is a latent-bug fix that only bites once a non-768
+short edge is reachable: video/video_audio *reference material* geometry was
+resolved against the MINIMAX_H3_BASE_SHORT_EDGE constant instead of the
+request's short edge, so a ref2va/v2v reference would have been preprocessed
+at a different scale than the canvas it conditions. The target canvas and the
+deferred fl2va keyframe geometry already threaded the request value.
+
+Applies cleanly to lmsysorg/sglang:dev @ c7c03ec53b:
+  git apply -p1 minimax-h3-short-edge.patch     # from /sgl-workspace/sglang
+---
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/resolved_plan.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/resolved_plan.py
+@@ -20,6 +20,7 @@
+ from __future__ import annotations
+ 
+ import math
++import os
+ from collections.abc import Mapping
+ from typing import Any
+ 
+@@ -40,10 +41,57 @@
+ 
+ MINIMAX_H3_SHAPE_POLICY_VERSION = "adapt_shape_v1"
+ MINIMAX_H3_BASE_SHORT_EDGE = 768
++# Deliberately NOT derived from the accepted short edge: this is the model's tested token
++# budget, not a function of the request. Scaling it down with a smaller short edge would make
++# the soft cap newly clip ratios it was never meant to clip -- at a 480px short edge a 16:9
++# canvas is 414,720px, and a 480-derived cap would scale it *down* to something narrower than
++# 16:9. Left fixed, the cap is simply inert below 768 (the widest supported 4:1 ratio at 480 is
++# 921,600px, still under it), which is the intended behaviour.
+ MINIMAX_H3_MAX_PIXELS = MINIMAX_H3_BASE_SHORT_EDGE * 1344
+ MINIMAX_H3_CANVAS_MULTIPLE = 32
+ MINIMAX_H3_MIN_ASPECT_RATIO = 1.0 / 4.0
+ MINIMAX_H3_MAX_ASPECT_RATIO = 4.0
++
++#: Comma-separated extra short edges to accept, e.g. ``"480"``. Unset -- the default -- leaves
++#: the released 768-only policy byte-for-byte as it was, including the error messages.
++MINIMAX_H3_EXTRA_SHORT_EDGES_ENV = "SGLANG_MINIMAX_H3_EXTRA_SHORT_EDGES"
++
++
++def minimax_h3_allowed_short_edges() -> tuple[int, ...]:
++    """Which values ``target.short_edge`` may take, ascending. Always includes 768.
++
++    The resolver below is already fully parametric in ``base_short_edge`` -- nominal edge times
++    ratio, soft area cap, nearest 32px grid -- so the 768 restriction lives entirely in the two
++    validators that call this. Widening it is therefore a policy change, not a math change, and
++    it is gated behind an environment variable because it is genuinely out of distribution:
++    H3-Base is released as a 768px model, every official example requests 768, and there is no
++    published non-768 output to diff a result against. A deployment that sets this is choosing
++    to validate the output itself.
++
++    Entries must be positive multiples of `MINIMAX_H3_CANVAS_MULTIPLE`. Otherwise the resolver's
++    nearest-grid rounding would quietly serve a *different* short edge than the one asked for
++    (500 becomes 512), and a request that silently changes geometry is worse than one that is
++    refused.
++    """
++    extra: list[int] = []
++    for token in os.environ.get(MINIMAX_H3_EXTRA_SHORT_EDGES_ENV, "").split(","):
++        token = token.strip()
++        if not token:
++            continue
++        try:
++            value = int(token)
++        except ValueError as exc:
++            raise ValueError(
++                f"{MINIMAX_H3_EXTRA_SHORT_EDGES_ENV} must be a comma-separated list of "
++                f"integers, got {token!r}"
++            ) from exc
++        if value <= 0 or value % MINIMAX_H3_CANVAS_MULTIPLE:
++            raise ValueError(
++                f"{MINIMAX_H3_EXTRA_SHORT_EDGES_ENV} entries must be positive multiples of "
++                f"{MINIMAX_H3_CANVAS_MULTIPLE}, got {value}"
++            )
++        extra.append(value)
++    return tuple(sorted({MINIMAX_H3_BASE_SHORT_EDGE, *extra}))
+ 
+ 
+ class MiniMaxH3MaterialPlanItem(msgspec.Struct, frozen=True):
+@@ -97,13 +145,17 @@
+ 
+ 
+ def _validate_base_short_edge(value: Any) -> int:
++    allowed = minimax_h3_allowed_short_edges()
++    # Collapses to the literal "768" when nothing is opted in, keeping both released messages.
++    expected = allowed[0] if len(allowed) == 1 else f"one of {list(allowed)}"
+     try:
+         short_edge = int(value)
+     except (TypeError, ValueError) as exc:
+-        raise ValueError("target.short_edge must be 768") from exc
+-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE or value != short_edge:
++        raise ValueError(f"target.short_edge must be {expected}") from exc
++    if short_edge not in allowed or value != short_edge:
+         raise ValueError(
+-            f"target.short_edge must be 768 for MiniMax H3 shape policy v2, got {value!r}"
++            f"target.short_edge must be {expected} for MiniMax H3 shape policy v2, "
++            f"got {value!r}"
+         )
+     return short_edge
+ 
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/request_validation.py
+@@ -18,6 +18,9 @@
+     MINIMAX_H3_MIN_DURATION_SECONDS,
+     MINIMAX_H3_SUPPORTED_FPS,
+ )
++from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
++    minimax_h3_allowed_short_edges,
++)
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
+     MINIMAX_H3_CONDITION_ROLE_REFERENCE,
+@@ -83,9 +86,13 @@
+     # compatibility keys are ignored; only these three declared values are
+     # validated and emitted below.
+     short_edge = _require_int(target.get("short_edge"), f"{path}.short_edge")
+-    if short_edge != 768:
++    allowed = minimax_h3_allowed_short_edges()
++    if short_edge not in allowed:
++        # Identical to the previous message when nothing is opted in, so the released
++        # deployment's error text does not change.
++        expected = allowed[0] if len(allowed) == 1 else f"one of {list(allowed)}"
+         raise ValueError(
+-            f"{path}.short_edge must be 768 for minimax_h3, got {short_edge}"
++            f"{path}.short_edge must be {expected} for minimax_h3, got {short_edge}"
+         )
+     aspect_ratio = _require_str(target.get("aspect_ratio"), f"{path}.aspect_ratio")
+     if profile.aspect_ratio_forced_auto and aspect_ratio != "auto":
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/prequeue.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/prequeue.py
+@@ -22,7 +22,6 @@
+     minimax_h3_probe_material,
+ )
+ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+-    MINIMAX_H3_BASE_SHORT_EDGE,
+     MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY,
+     MiniMaxH3ResolvedPlan,
+     minimax_h3_plan_from_batch,
+@@ -298,7 +297,12 @@
+                 resolved = minimax_h3_resolve_spatial_shape(
+                     width=width,
+                     height=height,
+-                    base_short_edge=MINIMAX_H3_BASE_SHORT_EDGE,
++                    # The request's own short edge, matching how the target canvas and the
++                    # deferred fl2va geometry above are both resolved. The constant used to be
++                    # passed here, which was equivalent while only 768 was accepted but would
++                    # otherwise preprocess a video reference to a different scale than the
++                    # canvas it is conditioning.
++                    base_short_edge=int(shape["base_short_edge"]),
+                 )
+             elif material.material_chain == "image.reference_preserve":
+                 width, height = _display_shape(

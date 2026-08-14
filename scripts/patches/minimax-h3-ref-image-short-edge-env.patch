@@ -1,0 +1,21 @@
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py
+index 3115813983..107d56adbb 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ 
+ import functools
+ import math
++import os
+ from typing import Any
+ 
+ import torch
+@@ -37,7 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
+     minimax_h3_scoped_encode_rng,
+ )
+ 
+-MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
++MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = int(os.environ.get("SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE", 2048))
+ MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
+ MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
+ MINIMAX_H3_AUDIO_CHANNELS = 2

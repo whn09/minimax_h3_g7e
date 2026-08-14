@@ -1,0 +1,16 @@
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/decoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/decoding.py
+index 77d8e074aa..7e21323a84 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/decoding.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/stages/decoding.py
+@@ -89,7 +89,10 @@ def _reverse_normalize_latents_(
+         )
+     view_shape = [1] * latents.ndim
+     view_shape[1] = int(mean.shape[0])
+-    return latents.mul_(std.view(*view_shape)).add_(mean.view(*view_shape))
++    # Out-of-place: with CPU offload the stage runs under inference_mode(False), where an
++    # in-place update to an inference tensor (latents come from the @inference_mode denoise
++    # loop) raises. Out-of-place costs one latent-sized buffer and works in both modes.
++    return latents * std.view(*view_shape) + mean.view(*view_shape)
+ 
+ 
+ def _crop_to_target_canvas(batch: Req, frames: torch.Tensor) -> torch.Tensor:

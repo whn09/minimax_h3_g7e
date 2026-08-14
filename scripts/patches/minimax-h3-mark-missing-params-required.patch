@@ -1,0 +1,19 @@
+diff --git a/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py b/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py
+index 15346d4d43..c0b9d4f2d3 100644
+--- a/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py
++++ b/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py
+@@ -1202,8 +1202,13 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+         self._resolved_attention_backend = backend.get_enum()
+ 
+     def _mark_missing_params_required(self) -> None:
++        # Only claim params that have not already declared their own policy: a
++        # quantization method's create_weights() may legitimately register scale
++        # params it can synthesize (e.g. weight-only NVFP4 has no input_scale and
++        # marks it "ones"). Blanket-stamping "error" here would clobber that.
+         for _, param in self.named_parameters():
+-            param.missing_param_init = "error"
++            if getattr(param, "missing_param_init", None) is None:
++                param.missing_param_init = "error"
+ 
+     def post_load_weights(self) -> None:
+         for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER:
