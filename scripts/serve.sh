@@ -375,6 +375,15 @@ for i in $(seq 1 60); do
     docker exec "$NAME" bash -lc "tail -40 $LOG" >&2
     exit 1
   fi
+  # The pgrep above is NOT a reliable death test: something in the launcher's process tree keeps
+  # matching after the scheduler exits, so a start that died at 90 s still burned the full 600 s
+  # timeout (four arms x 10 min on the c0b6474 audio_vae failure). The log markers are definitive.
+  if docker exec "$NAME" bash -lc \
+       "tr '\r' '\n' < $LOG | grep -qE 'scheduler is dead|Exit code: [1-9]|Server warmup failed'"; then
+    echo "$VARIANT replica failed -- last log:" >&2
+    docker exec "$NAME" bash -lc "tr '\r' '\n' < $LOG | tail -40" >&2
+    exit 1
+  fi
 done
 echo "timed out waiting for health on $VARIANT (port $PORT)" >&2
 docker exec "$NAME" bash -lc "tail -40 $LOG" >&2

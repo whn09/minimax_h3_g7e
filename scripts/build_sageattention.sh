@@ -15,9 +15,11 @@ REF=${REF:-d1a57a5}
 JOBS=${JOBS:-8}
 REPO=${REPO:-https://github.com/thu-ml/SageAttention}
 
-# 自检和预检都必须在源码目录**之外**跑。在 /sgl-workspace/SageAttention 里 `import sageattention`
-# 命中的是源码那个包(没有编好的 `_fused` 扩展),报的是 "cannot import name '_fused' ...
-# partially initialized module" —— 看着像编译失败,其实 pip 已经 Successfully installed 了。
+# 自检和预检都必须在源码目录**之外**跑（末尾那个自检前有一句 `cd /tmp`，别删）。在
+# /sgl-workspace/SageAttention 里 `import sageattention` 命中的是源码那个包(没有编好的 `_fused`
+# 扩展),报的是 "cannot import name '_fused' ... partially initialized module" —— 看着像编译失败,
+# 其实 pip 已经 Successfully installed 了。第一版少了这句 cd，h3n 容器那次就是这么"失败"的
+# (log 里 Successfully installed sageattention-2.2.0 之后紧跟一个 ImportError)。
 docker exec -w /tmp "$NAME" bash -lc "
 set -e
 python3 -c 'import sageattention' 2>/dev/null && { echo 'ALREADY_INSTALLED'; exit 0; }
@@ -30,5 +32,6 @@ export TORCH_CUDA_ARCH_LIST=12.0
 export MAX_JOBS=$JOBS
 export EXT_PARALLEL=$JOBS NVCC_APPEND_FLAGS='--threads 2'
 pip install --no-build-isolation -v . 2>&1 | tail -25
+cd /tmp
 python3 -c 'import sageattention, torch; print(\"sage ok\", sageattention.__file__, torch.__version__)'
 "

@@ -68,19 +68,20 @@
 
 | 路径 | 内容 |
 |---|---|
-| `scripts/` | **部署要用的 13 个**，见下表 |
+| `scripts/` | **部署要用的 15 个**，见下表 |
 | `scripts/patches/` | 5 个 sglang 补丁（480p、width/height、CPU offload、参考短边 env、缺参策略），`serve.sh` 自动应用；外加 2 个 NVFP4 必需的源码补丁（TMA 标度布局、qkv 块标度行序），由 `g7e_nvfp4_table.sh` 应用 |
 | `scripts/assets/` | 示例输入素材（都是我们自己生成的 t2va 片子切出来的，可随意用） |
 | `scripts/bench/` | 测量工具，只用来复核数字，部署不需要 |
 | `scripts/capacity/` | 抢 g7e 机器用的（spot 配额/容量探测），跑在 Jump box 上 |
 | `scripts/rejected/` | 被否掉方案的脚本（早期 NVFP4、FA4、SageAttention 3），留作证据，别照着跑 |
 
-部署只需要顶层这 13 个：
+部署只需要顶层这 15 个：
 
 | 脚本 | 用途 |
 |---|---|
-| `nvfp4_quantize_transformer.py` | 从 stock bf16 权重量化出 NVFP4 checkpoint（~90 s）。**交付路径的第一步** |
-| `nvfp4_canonicalize.py` | 把第三方（ComfyUI 转换器）导出的 NVFP4 文件掰成 sglang 期望的布局；只有 Ref2VA 有现成的，FL2VA 得用上面那个自己量化 |
+| `g7e_quant.sh` | **交付路径的第一步**：两个 partition 都从 stock bf16 自己量化出 NVFP4（各约 10 min，纯 CPU） |
+| `nvfp4_quantize_transformer.py` | 上面那个脚本调的量化器（配方与自检写在文件头） |
+| `nvfp4_canonicalize.py` | 历史参考：把第三方（ComfyUI 转换器）导出的 NVFP4 掰成 sglang 期望的布局。现在两个 partition 都自量化，不需要它 |
 | `build_sageattention.sh` | 在容器里从源码编 SageAttention（sm_120），pip 上的 wheel 只值 1.16× |
 | `g7e_levers.sh` | 旋钮消融（BCG，1 卡和 2 卡），每个 arm 自带同 session 的 base 分母 + 回读后端 |
 | `g7e_nvfp4_table.sh` | 量 NVFP4[+sage] 的 16 格表：两个 variant × 1/2 卡 × 4 个几何，自动打两个 NVFP4 补丁 |
@@ -92,6 +93,7 @@
 | `quality_pair_local.sh` | 同上，但在笔记本上对已下载的 mp4 跑 |
 | `g7e_2card_sage.sh` | 量「加卡值多少」：同机 1 卡分母 + 2 卡 Ulysses=2，跑完自动对画质 |
 | `g7e_ref_edge_sweep.sh` | 扫 ref2va 的参考图短边（1024/768/512），**有损**方向，跑完自动对画质 |
+| `g7e_dev_levers.sh` | 在最新 sglang（`:dev`）上做旋钮消融（Cache-DiT / adaln），另起容器 `h3n`，见「最新 sglang」一节 |
 
 `scripts/bench/` 里的 7 个是复核用的：`attn_bench_sage.py`（attention 单点，H3 真实形状
 `seq=41456`）、`attn_bench.py`、`gemm_bench.py`（这张卡的实测峰值）、`prof_step.sh` +
@@ -175,18 +177,12 @@ docker commit h3 h3-sage:local
 
 ### 3.5 准备 NVFP4 checkpoint 并打两个补丁（约 3 分钟）
 
-两个 partition 各要一个 checkpoint，来路不同：
+**两个 partition 都从 stock bf16 自己量化**，不用任何第三方文件：
 
 ```bash
-# FL2VA：从 stock bf16 现量化（~90 s，纯 CPU，峰值 host RAM ≈ 文件大小）
-docker cp nvfp4_quantize_transformer.py h3:/tmp/
-docker exec -e SRC=/models/MiniMax-H3/FL2VA/transformer -e DST=/out/nvfp4_fl2va.safetensors \
-  h3 python3 /tmp/nvfp4_quantize_transformer.py
-# 期望结尾：wrote ...: 951 tensors (q=208 fp8=50 copy=277) worst rel=0.0951
-
-# Ref2VA：lilcheaty/MiniMax-H3-NVFP4 的 *_nvfp4_mixed.safetensors，下完必须规范化
-docker cp nvfp4_canonicalize.py h3:/out/
-docker exec h3 python3 /out/nvfp4_canonicalize.py     # -> /out/nvfp4_ref2va_fixed.safetensors
+./g7e_quant.sh          # FL2VA + Ref2VA，各约 10 min，纯 CPU
+                        # -> /out/nvfp4_fl2va.safetensors、/out/nvfp4_ref2va.safetensors
+# 期望结尾：wrote ...: 951 tensors (q=208 fp8=50 copy=277) worst rel=0.09xx
 
 # 两个源码补丁（幂等，改的是容器里的 sglang，不走 serve.sh 那套 .patch 流程）
 for p in patch_nvfp4_tma_scale_layout.py patch_h3_qkv_scale_reorder.py; do
@@ -194,10 +190,18 @@ for p in patch_nvfp4_tma_scale_layout.py patch_h3_qkv_scale_reorder.py; do
 done
 ```
 
-FL2VA 也可以走第三方，但那边只有裁过的 `_pruned_nvfp4`，和 stock 权重不是一回事，所以自己量化。
-两条路出来的配方是同一套：208 个线性层 nvfp4 + 50 个 `adaln_proj.linear.weight` 裸 fp8（占 DiT 权重
-40% 但算力 0%，纯显存项）+ 其余 bf16，951 个张量，无 `input_scale`；round-trip 相对误差
-0.094–0.0951 = group-16 e2m1 的量化地板，比这个大很多就是打包/标度算错了。
+配方：208 个线性层 nvfp4 + 50 个 `adaln_proj.linear.weight` 裸 fp8（占 DiT 权重 40% 但算力 0%，
+纯显存项）+ 其余 bf16，951 个张量，无 `input_scale`；round-trip 相对误差 0.094±0.002 =
+group-16 e2m1 的量化地板，比这个大很多就是打包/标度算错了。两个补丁修的是 sglang 的加载/GEMM
+路径，与 checkpoint 来路无关，任何 NVFP4 文件都要打。
+
+**历史**：Ref2VA 早先用的是 lilcheaty 的 `MiniMax_H3_Ref2VA_nvfp4_mixed.safetensors` 过
+`nvfp4_canonicalize.py`（→ `nvfp4_ref2va_fixed.safetensors`），因为 FL2VA 那边第三方只有裁过的
+`_pruned_nvfp4`、逼着我们写了量化器；量化器与 partition 无关，B300 上 `runquant.sh` 两个都是
+自量化的，那半张 ref2va NVFP4 表（16 格，2.28–2.33× vs BF16）全出自自量化文件。所以现在统一
+自量化：少一道 canonicalize、无第三方来源问题。`nvfp4_canonicalize.py` 只作历史参考
+（要复现旧 `*_fixed` 文件时才用）。g7e 上自量化 Ref2VA **还差一次确认跑**（同 seed 对
+`nvfp4_ref2va_fixed` 做 quality_pair + 性能），机器被回收前没排上。
 
 `g7e_nvfp4_table.sh` 会自己做这一整步，所以只想量表的话可以跳过。
 
@@ -221,10 +225,12 @@ VARIANT=fl2va GPUS=1 ULYSSES=1 ENVX="$NVFP4ENV" \
 VARIANT=ref2va GPUS=1 ULYSSES=1 \
   ENVX="$NVFP4ENV SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE=1024" \
   EXTRA="--layerwise-offload-components text_encoder \
-         --transformer-weights-path /out/nvfp4_ref2va_fixed.safetensors $SAGE" ./serve.sh start
+         --transformer-weights-path /out/nvfp4_ref2va.safetensors $SAGE" ./serve.sh start
 ```
 
 三个 NVFP4 env 和两个源码补丁（第 3.5 步）缺一个就是废片或起不来，见「关于 4-bit」一节。
+（README 顶部那张 ref2va 表是在旧的 `nvfp4_ref2va_fixed.safetensors` 上量的；自量化文件配方相同、
+在 B300 上已用满，g7e 上换过来后建议先跑一格 `quality_pair.sh` 对齐。）
 **别传 `--quantization modelopt_fp4`**：从 safetensors 自动推断的配置才是对的，显式给会建出一个空的
 不能用的 config。想退回 FP8 就把 `--transformer-weights-path` 和三个 NVFP4 env 换成
 `--quantization fp8`，其余不动。
@@ -236,7 +242,7 @@ VARIANT=ref2va GPUS=1 ULYSSES=1 \
 DEVICES=0 VARIANT=fl2va  GPUS=1 ULYSSES=1 ENVX="$NVFP4ENV" \
   EXTRA="--layerwise-offload-components text_encoder --transformer-weights-path /out/nvfp4_fl2va.safetensors $SAGE" ./serve.sh start
 DEVICES=1 VARIANT=ref2va GPUS=1 ULYSSES=1 ENVX="$NVFP4ENV SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE=1024" \
-  EXTRA="--layerwise-offload-components text_encoder --transformer-weights-path /out/nvfp4_ref2va_fixed.safetensors $SAGE" ./serve.sh start
+  EXTRA="--layerwise-offload-components text_encoder --transformer-weights-path /out/nvfp4_ref2va.safetensors $SAGE" ./serve.sh start
 ```
 
 单条延迟优先、且能接受占满 2 卡跑一个请求时，改用 Ulysses：`GPUS=2 ULYSSES=2`
@@ -378,6 +384,69 @@ BF16 是 **1.091 s/步**，FP8 把 KV 字节减半后是 **0.722 s/步**，**sag
 $0.017040、Ulysses=8 $0.019690。**g7e 的 3 年 SP 每成片秒便宜 1.55×**，但单条延迟 B300 快
 2.33×（49.1 vs 114.4 s）、8 卡 Ulysses 能压到 7.1 s。买单价选 g7e，买延迟选 B300。
 
+## 最新 sglang（c0b6474，2026-08-17）实测
+
+镜像身份先说清：交付用的 `lmsysorg/sglang:h3-validated` = `0.0.0.dev1+g273d978be`（2026-08-12），
+`lmsysorg/sglang:dev` = `0.0.0.dev1+gc0b6474b4`（2026-08-17），**在 g7e 这台上是两个不同 digest**
+（tag 可变，谁后 pull 谁不一样，别拿别的机器上的等号当结论）。跑法见
+`scripts/g7e_dev_levers.sh`（另起容器 `h3n`，两个容器不能同时起 server）。
+
+**换镜像本身零收益**（NVFP4+sage，1 卡，fl2va，同 seed）：
+
+| 场景 | 273d978be | c0b6474 | 差 |
+|---|---|---|---|
+| 768p/20 | 114.484 s | 115.102 s | +0.54% |
+| 480p/20 | 31.336 s | 31.44 s | +0.33% |
+
+两个 NVFP4 python 补丁在 c0b6474 上**仍然都要打、也都还能打**（上游没修 sm_120 的标度布局分支）。
+
+**唯一有收益的旋钮是 Cache-DiT，1.92×，但有损**。它不是 `--cache-dit-config`（那条只喂 diffusers
+后端），H3 走 native pipeline，旋钮全在 env（`multimodal_gen/envs.py:46-65`）：
+`SGLANG_CACHE_DIT_ENABLED` + `_FN/_BN/_WARMUP/_RDT/_MC/_TAYLORSEER`，`_SECONDARY_*` 给音频那条
+transformer。c0b6474 才修对 H3 的 residual input preservation，旧镜像上读出来是 0。
+
+| arm | 768p/20 | 480p/20 | 768p SSIM(Y/All) | 480p SSIM(Y/All) |
+|---|---|---|---|---|
+| base | 115.102 s | 31.44 s | — | — |
+| `_RDT=0.24 _MC=3`（默认值） | **60.079 s（1.92×）** | **16.437 s（1.91×）** | 0.9447 / 0.9587 | **0.8307** / 0.8770 |
+| `_RDT=0.04 _MC=1` | 114.997 s | 31.448 s | 1.000000 | 1.000000 |
+
+- `_RDT=0.04` 是**纯空转**：SSIM 逐格 1.000000 = 一次都没触发，别把它当"保守档"报。
+- RDT 0.24 下运动能量掉得比 SSIM 更难看：768p 0.7190→0.6932，480p **1.5170→1.1554**（−24%）——
+  cache 复用的是 residual，掉的正是运动，480p 上肉眼可见。
+- 每次都要从 serve 日志回读 `Enabling cache-dit on transformer with config: Fn=1, Bn=0, W=4,
+  R=0.24, MC=3 ...`；看到 `Acceleration hooks is disabled for: BlockAdapter` 就是没挂上。
+- **请求里带 `quality` 字段会把它整个关掉**（`stages/denoising.py:407`
+  `... and "quality" not in explicit_fields`），所以别加 `h3gen.py --quality`。
+  而 `quality="high"` 自带的那组审过参数 fail-close 在写死的部署门（4×H200 / 50 步 / sm_9.0），
+  g7e 永远进不去。
+- 与 `--dit-layerwise-offload` 互斥。
+
+成本口径（$0.000497165/卡·秒，成片 5.175 s）：768p/20 $0.011058 → **$0.005772**、
+480p/20 $0.003020 → **$0.001579** 每成片秒。
+
+**但这个 1.92× 还不能采纳**，缺一个等成本对照：20 步 + RDT 0.24 的耗时正好≈**10 步 base**
+（768p 算出来 10.18 步、480p 9.98 步）。要判的是"同样花 60 s，cache 20 步和 base 10 步谁离
+20 步的参考片更近"，以及 RDT 在 0.04（空转）和 0.24（−24% 运动）之间的拐点在哪。这两组
+（`ARMS="cacheR08_1 cacheR12_1 cacheR16_1 cacheR20_1"` 和 `ARMS="base_1" CASES="768_10 480_10"`）
+**没跑成**：机器在 dev-levers 收尾后 3 分钟被 spot 回收（`i-0b371ad3aee78e285`，
+`Service initiated 2026-08-19 17:01:09 GMT`），NVMe 上的成片没来得及下载。
+
+**`--minimax-h3-adaln-online` 与量化互斥，实测报错**：
+`ValueError: MiniMax H3 AdaLN cache is only compatible with unquantized weights`
+（`runtime/models/dits/minimax_h3.py:1468`，条件是 `quant_config is not None`）。它省的 24.2 GiB
+adaln_proj 是 BF16 口径，NVFP4 下这部分本来就量化过，省不到那么多，凑不出一卡两副本。
+
+**c0b6474 会打死我们的全局 sage 配置**：新镜像里 `audio_vae` 也去 selector 解 attention 后端，
+而它只声明 `['fa','torch_sdpa']` → `selector.py:300 ValueError` →
+`Failed to load customized audio_vae` → `Rank 0 scheduler is dead`。三个非 DiT 组件一律豁免，
+**逗号分隔**：
+
+```bash
+--attention-backend sage_attn \
+--component-attention-backends text_encoder=torch_sdpa,audio_vae=torch_sdpa,video_vae=torch_sdpa
+```
+
 ## sglang 的并行旋钮（源码核对 + 实测）
 
 我们跑的配置里这些默认全是关的（从 serve 日志的 `server_args` 读）：
@@ -389,7 +458,7 @@ $0.017040、Ulysses=8 $0.019690。**g7e 的 3 年 SP 每成片秒便宜 1.55×**
 | `--batching-max-size N` | 原生 diffusion batching 是真实现的（`managers/scheduler.py` + `managers/dynamic_batch_admission.py`，默认 1 = 纯串行），**但 `_can_dynamic_batch()` 里有 `image_path is not None -> return False`** —— fl2va/ref2va 都带输入图，永远进不了 batch，只有纯文本 t2va 能。所以**同一个副本上的并发请求是排队串行的**，别用"单条延迟取倒数"估吞吐。 |
 | `--dp-size N` | 内置数据并行：一个 ingress 端口 + 内置负载均衡，可与 `--ulysses-degree` 组合。**这是 g7e.48xlarge 上唯一的吞吐杠杆**，而且一卡只能放一个副本（NVFP4+sage 峰值 52.0 GB，两个副本要 ≤48 GB）。 |
 | `--cfg-parallel-size` | **H3 用不了**：`configs/pipeline_configs/minimax_h3.py` 写死 `supports_cfg_parallel=False`，checkpoint 是 CFG 蒸馏的、只有一条正分支。 |
-| `--enable-breakable-cuda-graph` | 把 DiT forward 抓成 CUDA graph 段（在 attention 处断开），省 kernel launch 开销、数值无损。B300 上实测**白开**（8 卡 768p 噪声内、480p 慢 3.8%，多吃 35 GB），说明 H3 的 DiT 不是 launch-bound。 |
+| `--enable-breakable-cuda-graph` | 把 DiT forward 抓成 CUDA graph 段（在 attention 处断开），省 kernel launch 开销、数值无损。**g7e 单卡实测起不来**（`g7e_levers.sh` 的 `bcg_1`）：warmup 阶段 `CUDA error: device-side assert triggered`，从 `layerwise_offload.py:317 prefetch_layer` 的 `copy_stream.wait_stream(...)` / `event.record(stream)` 冒出来，随后 `Server warmup failed; aborting startup` —— 和 g7e 上强制的 text encoder layerwise offload 撞。B300 上 8 卡能起但**白开**（768p 噪声内、480p 慢 3.8%，多吃 35 GB），1 卡也崩（那边是 `illegal memory access`）。结论：H3 的 DiT 不是 launch-bound。 |
 | `--enable-torch-compile` | 与上一条互斥，且 flag 自己的帮助文本写了 "will likely cause precision drifts"。 |
 | `--attention-backend <后端>` | **H3 的 DiT 走 packed varlen（视频+音频 token 拼成一条不定长序列），所以能选的后端只有 5 个**：`sage_attn`（交付用的 sage 2）、`fa`（sm_120 上被静默降级）、`torch_sdpa`、`sol_attn`、`subblock_sparse_attn`（要 sm_100a，这张卡不行）。判据是 impl 有没有覆写 `forward_varlen`（`backends/attention_backend.py:45`），不满足的在 `minimax_h3.py:192 validate_server_args` 就 `ValueError` 起不来。所以 `sage_attn_3` / `video_sparse_attn` / `vmoba` / `block_sparse_attn` / `sliding_tile_attn` 等**全部对 H3 不可用**，见「被否掉的方案」。 |
 
@@ -410,7 +479,8 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
    ——测出来就是纯 BF16 的数。per-component 后端是只在组件加载期存活的 contextvar，而 H3 的 DiT
    首次 forward 才解析 backend。必须用全局 `--attention-backend sage_attn`。
 2. **全局 sage 必须给 text encoder 豁免** `text_encoder=torch_sdpa`：Qwen3VL 的 `LocalAttention`
-   只认 `{fa, torch_sdpa}`，否则起服务就死。
+   只认 `{fa, torch_sdpa}`，否则起服务就死。**在 c0b6474 上要豁免三个**（加 `audio_vae`、
+   `video_vae`），见「最新 sglang」一节。
 3. **`SGLANG_USE_RUNAI_MODEL_STREAMER=0` 不能省**：Run:ai streamer 会攒匿名内存把主机打爆，
    关掉走 mmap。
 4. **`--attention-backend fa` 在 sm_120 会被静默降级**（gate 在 `_FlashAttentionBackendResolver`），
@@ -446,7 +516,8 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
   **是报错不是静默回落**（早先写的"装不上会静默降级 TORCH_SDPA"是错的，H3 在参数校验阶段就先拒了）。
   要它能用只能给上游的 `backends/sage_attn3.py` 实现 `forward_varlen`。脚本留在
   `scripts/rejected/build_sageattention3.sh`。同一条判据也封掉了所有稀疏 attention 后端。
-- **DiT cache / 跳步**（TeaCache 等三套）：层次上接不上 H3。
+- **DiT cache / 跳步**：外挂的三套（TeaCache 等）层次上接不上 H3。sglang **自带**的 Cache-DiT 在
+  c0b6474 上是真挂上了、值 1.92×，但有损且缺等成本对照，见「最新 sglang」一节 —— 未采纳，未否掉。
 - **FlashAttention-4**：sm_120 两条路全封。
 - **裸算力优化**：单卡已在 roofline 上——attention 实测 368.7 TFLOPS（峰值 409.9 的 90%）、四个线性层
   403–414 TFLOPS（100%），trace 里非 matmul 只占 4.1%。所以能动的只有 attention 的**数值精度**
