@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
-# Bring up MiniMax-H3 on p5e.48xlarge (8xH200) with the 480p short-edge patch applied.
+# Bring up a MiniMax-H3 sglang server with the 480p short-edge patch applied. Platform-neutral:
+# the same script serves g7e (2x RTX PRO 6000, 96 GB), B300 and H200 -- what changes is GPUS /
+# ULYSSES / OFFLOAD / --transformer-weights-path, all passed in by the per-platform driver.
 #
-# This is the exact sequence that produced RESULTS.md, wrapped in a script. It creates a long
-# lived `sleep infinity` container, applies the patch to the source inside it, then starts the
-# server detached -- so restarting the server with different flags does not re-pull the image or
-# re-apply the patch.
+# It creates a long lived `sleep infinity` container, applies the patches to the source inside it,
+# then starts the server detached -- so restarting the server with different flags does not re-pull
+# the image or re-apply the patches.
 #
-# THE DEFAULTS ARE THE RECOMMENDED H200 CONFIG: 8 GPUs, TP=1, Ulysses=8, encoder-parallel auto,
-# 480p enabled, warmup covering 1344x768 + 864x480. That is the measured 10.05 s / 6.2 vid/min /
-# 95.9 GiB-per-GPU shape. Bare `./serve.sh` needs no arguments and no env vars.
+# THE DEFAULTS ARE THE ORIGINAL 8-GPU H200 SHAPE (GPUS=8, TP=1, Ulysses=8, encoder-parallel auto,
+# 480p enabled, warmup covering 1344x768 + 864x480), so bare `./serve.sh` needs no arguments.
+# **On g7e you always override them** -- the delivered config is 1 card, NVFP4, SageAttention, and
+# text-encoder offload is mandatory there (63 GiB encoder + 62 GiB DiT does not fit in 96 GB):
+#   GPUS=1 ULYSSES=1 EXTRA="--layerwise-offload-components text_encoder \
+#     --transformer-weights-path /out/nvfp4_fl2va.safetensors \
+#     --attention-backend sage_attn --component-attention-backends text_encoder=torch_sdpa"
+# On B300 (275 GB/card) drop the offload and the sage flags, and NVFP4 needs a different env (its
+# stock trtllm fp4 GEMM is the correct one on sm_103) -- see the minimax_h3_b300 README.
+# The per-platform drivers (g7e_arm.sh / g7e_nvfp4_table.sh / g7e_levers.sh, b300_*.sh) assemble all
+# of this for you; prefer them over hand-writing the flags.
 #
 # THREE DEPLOYMENT MODES:
 #
@@ -66,8 +75,17 @@
 # MiniMaxH3ModularPipeline`.
 set -euo pipefail
 
-IMAGE=${IMAGE:-lmsysorg/sglang:dev}
+# `:dev` is a MOVING tag -- a later pull can replace a validated image under you. g7e_bringup.sh
+# re-tags whatever it pulled as `lmsysorg/sglang:h3-validated`, and that is what every driver
+# script passes, so the default here is the durable tag. IMAGE=lmsysorg/sglang:dev to chase HEAD.
+IMAGE=${IMAGE:-lmsysorg/sglang:h3-validated}
 NAME=${NAME:-h3}
+# On by default: without it sglang SILENTLY moves the HTTP port when it thinks yours is taken
+# ("Port 30031 was unavailable, using port 30073 instead") and every health poll below then waits
+# on a port nobody listens to. Cost a wasted arm: two replicas at 30030/30031 collided because
+# sglang derives neighbour ports (30073 + a ZMQ broker on 30074) from --port, so PORTs for
+# coexisting replicas must be spaced by ~100, not 1. STRICT_PORTS= turns the drift back on.
+STRICT_PORTS=${STRICT_PORTS-1}
 # GPUs this replica may touch, as a device list. CUDA_VISIBLE_DEVICES is accepted under its own
 # name because that is what anyone would reach for; DEVICES is the same knob with a shorter name.
 # Empty = every GPU on the box. --base-gpu-id does NOT do this, it is silently ignored, so pinning
@@ -130,9 +148,10 @@ EXTRA=${EXTRA:-}
 
 # Local weights dir on the host (mounted as /models/MiniMax-H3), or an HF repo id via MODEL=.
 # It holds BOTH partitions -- FL2VA/ (serves t2va and fl2va) and Ref2VA/ -- so it is named for the
-# model, not for one partition. For VARIANT=ref2va or `both` the Ref2VA/ side must be filled in;
-# see fill_ref2va.sh, which downloads only Ref2VA/transformer (62 GiB) and hardlinks the other 16
-# files, which are bit-identical to FL2VA's.
+# model, not for one partition. For VARIANT=ref2va or `both` the Ref2VA/ side must be filled in --
+# g7e_bringup.sh downloads both by default (269 GB, Ref2VA/ first so a ref2va server can start while
+# FL2VA/ is still coming down). To fill only the missing half later:
+#   hf download MiniMaxAI/MiniMax-H3 --include 'Ref2VA/*' --local-dir /opt/dlami/nvme/h3
 # Falls back to the old h3-fl2va name so a box provisioned before the rename keeps working; the
 # container's bind mount is created from whichever path wins here.
 WEIGHTS=${WEIGHTS:-/opt/dlami/nvme/h3}
@@ -168,8 +187,13 @@ case "${1:-start}" in
     # the `bash -lc "pkill -f 'model-variant ref2va' ..."` process too, so the killer died at the
     # first pkill. The server still went down (that signal was delivered), but the `-9` escalation
     # and the nvidia-smi report never ran, and the non-zero exit aborts any `set -e` caller.
+    # STOPPAT= scopes the kill to one replica when VARIANT cannot tell them apart -- two ref2va
+    # replicas on separate GPUs (the NVFP4 sweep does this) only differ by port, so:
+    #   STOPPAT='[-]-port 30030' ./serve.sh stop
+    # Same bracket rule: without it the pattern matches the docker exec shell running the pkill.
     pat='[s]glang serve'
     [ -n "$VARIANT_EXPLICIT" ] && pat="model-variant [${VARIANT:0:1}]${VARIANT:1}"
+    [ -n "${STOPPAT:-}" ] && pat="$STOPPAT"
     docker exec "$NAME" bash -lc "pkill -f '$pat' || true; sleep 8; pkill -9 -f '$pat' || true; sleep 5"
     nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
     exit 0 ;;
@@ -250,14 +274,18 @@ echo "== applying patches (idempotent)"
 #     (SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE) -- that is the 1.46x lever on g7e, and inert unless set;
 #   mark-missing-params-required stops H3 from blanket-stamping every param "error", which clobbers
 #     a quant method's own missing-param policy. Needed for NVFP4, harmless for bf16.
+# PATCHES= narrows the list when the image moves and a patch no longer applies (this loop exits 1 on
+# DOES_NOT_APPLY, it does not skip). On c0b6474b4 (2026-08-17) cpu-offload-inplace is UPSTREAM (its
+# own rationale comment is in decoding.py now) and target-width-height needs a re-diff, so:
+#   PATCHES="minimax-h3-short-edge.patch minimax-h3-mark-missing-params-required.patch"
+PATCHES=${PATCHES:-"minimax-h3-cpu-offload-inplace.patch minimax-h3-short-edge.patch \
+                    minimax-h3-target-width-height.patch \
+                    minimax-h3-mark-missing-params-required.patch"}
 docker exec "$NAME" bash -lc '
   set -e
   cd /sgl-workspace/sglang
   STAMPS=/sgl-workspace/.h3-patches; mkdir -p $STAMPS
-  for n in minimax-h3-cpu-offload-inplace.patch \
-           minimax-h3-short-edge.patch \
-           minimax-h3-target-width-height.patch \
-           minimax-h3-mark-missing-params-required.patch; do
+  for n in '"$PATCHES"'; do
     p=/patches/$n
     [ -f "$p" ] || { echo "MISSING       $n" >&2; exit 1; }
     if git apply -p1 --check "$p" 2>/dev/null; then
@@ -320,6 +348,7 @@ docker exec -d "$NAME" bash -lc "
     ${OUTPATH:+--output-path $OUTPATH} \
     --warmup-resolutions $WARMUP \
     --master-port $MASTER --scheduler-port $SCHED \
+    ${STRICT_PORTS:+--strict-ports} \
     --host 0.0.0.0 --port $PORT $EXTRA > $LOG 2>&1"
 
 echo "== waiting for readiness (weights load + warmup; measured ~90 s at 8 GPUs)"
@@ -329,8 +358,9 @@ for i in $(seq 1 60); do
   if [ "$code" = "200" ]; then
     echo "ready after $((i*10))s"
     nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
-    echo "submit the recommended request with: python3 $HERE/h3req.py"
-    echo "  (or override: h3req.py [short_edge [steps [duration_s [out-prefix]]]])"
+    echo "submit a request with: python3 $HERE/h3gen.py --task $VARIANT --short-edge 768 \\"
+    echo "    --aspect 16:9 --duration 5.0 --steps 20 --port $PORT --out myclip"
+    echo "  (fl2va/ref2va also need --image <file> --inline; h3gen.py --help lists the rest)"
     if [ -n "$OUTPATH" ]; then
       echo "finished videos appear on the host in $OUTDIR/${OUTPATH#/out/}"
     else

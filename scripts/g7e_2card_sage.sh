@@ -24,7 +24,7 @@
 # ref2va 的数字用的是另一张输入图（不随库发布），耗时只跟参考短边有关、跟图内容无关，所以可比。
 set -u
 cd "${WORKDIR:-$(cd "$(dirname "$0")" && pwd)}"
-IMAGE=${IMAGE:-lmsysorg/sglang:dev}
+IMAGE=${IMAGE:-lmsysorg/sglang:h3-validated}   # 不用 :dev，那是会移动的 tag（g7e_bringup.sh 会建这个固定 tag）
 OUT=/opt/dlami/nvme/out
 TASK=${TASK:-fl2va}
 CASES=${CASES:-"480_20 480_30 768_20 768_30"}

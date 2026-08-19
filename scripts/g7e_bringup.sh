@@ -36,8 +36,9 @@ sudo apt-get install -y -qq python3.12-venv ffmpeg
 # from gone). Measured on 2026-08-14: sglang 273d978bed -> c4271c3fe1. Running containers are
 # unaffected (they keep their own filesystem), but a NEW container would come up on the new commit,
 # where the four git patches are unverified and sageattention would have to be rebuilt. Keep a
-# durable tag on the image you validated -- `docker tag <id> lmsysorg/sglang:h3-validated` -- and
-# pass IMAGE=lmsysorg/sglang:h3-validated to serve.sh.
+# durable tag on the image you validated. This script creates that tag for you (below, after the
+# pull) and every driver script defaults to it, so a later re-run of THIS script can pull a newer
+# `:dev` without moving `:h3-validated` -- the tag is only created when it does not already exist.
 docker pull "$IMAGE" > /tmp/pull.log 2>&1 &
 PULL=$!
 
@@ -52,4 +53,12 @@ $VENV/bin/hf download MiniMaxAI/MiniMax-H3 --include "*.json" --local-dir $DEST
 echo "JSON_DONE $(date -u +%FT%TZ) size=$(du -sh $DEST | cut -f1)"
 
 wait $PULL && echo "IMAGE_DONE $(docker images --format '{{.ID}}' "$IMAGE")"
+# Pin what we just pulled under a tag that never moves. `|| true` on the inspect: only tag when the
+# durable name is absent, so re-running bringup on a working box cannot clobber a validated image.
+if ! docker image inspect lmsysorg/sglang:h3-validated >/dev/null 2>&1; then
+  docker tag "$IMAGE" lmsysorg/sglang:h3-validated
+  echo "TAGGED lmsysorg/sglang:h3-validated -> $(docker images --format '{{.ID}}' "$IMAGE")"
+else
+  echo "KEPT existing lmsysorg/sglang:h3-validated ($(docker images --format '{{.ID}}' lmsysorg/sglang:h3-validated))"
+fi
 echo "BRINGUP_DONE $(date -u +%FT%TZ)"

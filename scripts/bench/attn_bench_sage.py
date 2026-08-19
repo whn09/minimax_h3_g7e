@@ -108,6 +108,9 @@ def main():
                 cands.append((fn_name, lambda q, k, v, _f=fn: _f(q, k, v, tensor_layout="NHD")))
     except ImportError as exc:
         print(f"sageattention unavailable: {exc}")
+    # sage 3 只在**这个 micro-bench 里**有意义：kernel 本身能编能跑，但 sglang 里
+    # `--attention-backend sage_attn_3` 对 H3 是起不来的（H3 的 DiT 要 packed varlen，
+    # 这个后端没实现 forward_varlen），所以这里量出来的数不能当成 E2E 可达。
     try:
         from sageattn3 import sageattn3_blackwell
 

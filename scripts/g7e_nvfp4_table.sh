@@ -42,7 +42,7 @@
 # （VAE 出帧、封装）推上去。
 set -u
 cd "${WORKDIR:-$(cd "$(dirname "$0")" && pwd)}"
-IMAGE=${IMAGE:-lmsysorg/sglang:dev}
+IMAGE=${IMAGE:-lmsysorg/sglang:h3-validated}   # 不用 :dev，那是会移动的 tag（g7e_bringup.sh 会建这个固定 tag）
 NAME=${NAME:-h3}
 OUT=/opt/dlami/nvme/out          # 主机视角
 COUT=/out                        # 容器里的同一个目录
