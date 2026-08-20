@@ -1,0 +1,3 @@
+# Dockerfile 只需要 patches/。不收窄的话 assets/ 里的 mp4 和 png 也会进 build context。
+*
+!patches/**

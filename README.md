@@ -94,21 +94,22 @@ ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`）
 
 | 路径 | 内容 |
 |---|---|
-| `scripts/` | **部署与测量要用的 21 个**，见下表 |
-| `scripts/patches/` | 5 个 sglang 补丁（480p、width/height、CPU offload、参考短边 env、缺参策略），`serve.sh` 自动应用；外加 2 个 NVFP4 必需的源码补丁（TMA 标度布局、qkv 块标度行序），由 `g7e_nvfp4_table.sh` 应用；再加 1 个只在测 sol_attn 时要打的（dense 回退换 sage，见「稀疏 attention」一节） |
+| `scripts/` | **部署与测量要用的 22 个** + `Dockerfile`，见下表 |
+| `scripts/patches/` | 5 个 sglang 补丁（480p、width/height、CPU offload、参考短边 env、缺参策略），`serve.sh` 自动应用；外加 2 个 NVFP4 必需的源码补丁（TMA 标度布局、qkv 块标度行序），由 `g7e_nvfp4_table.sh` 应用；再加 1 个只在测 sol_attn 时要打的（dense 回退换 sage，见「稀疏 attention」一节）；`inplace_ref_short_edge.sh` 是参考短边那一行的 in-place 版（`serve.sh` 和 `Dockerfile` 共用，理由写在文件头） |
 | `scripts/assets/` | 示例输入素材（都是我们自己生成的 t2va 片子切出来的，可随意用） |
 | `scripts/bench/` | 测量工具，只用来复核数字，部署不需要 |
 | `scripts/capacity/` | 抢 g7e 机器用的（spot 配额/容量探测），跑在 Jump box 上 |
 | `scripts/rejected/` | 被否掉方案的脚本（早期 NVFP4、FA4、SageAttention 3），留作证据，别照着跑 |
 
-顶层这 21 个：
+顶层这 22 个（外加 `Dockerfile`）：
 
 | 脚本 | 用途 |
 |---|---|
+| `Dockerfile` + `build_image.sh` | **把对原版镜像的 8 处运行时改动一次性烤成交付镜像**（见 §1.5）；`Dockerfile` 头部写了为什么值得这么做 |
 | `g7e_quant.sh` | **交付路径的第一步**：两个 partition 都从 stock bf16 自己量化出 NVFP4（各约 10 min，纯 CPU） |
 | `nvfp4_quantize_transformer.py` | 上面那个脚本调的量化器（配方与自检写在文件头） |
 | `nvfp4_canonicalize.py` | 历史参考：把第三方（ComfyUI 转换器）导出的 NVFP4 掰成 sglang 期望的布局。现在两个 partition 都自量化，不需要它 |
-| `build_sageattention.sh` | 在容器里从源码编 SageAttention（sm_120），pip 上的 wheel 只值 1.16× |
+| `build_sageattention.sh` | 在容器里从源码编 SageAttention（sm_120），pip 上的 wheel 只值 1.16×（用 §1.5 的镜像就不需要它） |
 | `g7e_levers.sh` | 旋钮消融（BCG，1 卡和 2 卡），每个 arm 自带同 session 的 base 分母 + 回读后端 |
 | `g7e_nvfp4_table.sh` | 量 NVFP4[+sage] 的 16 格表：两个 variant × 1/2 卡 × 4 个几何，自动打两个 NVFP4 补丁 |
 | `g7e_bringup.sh` | 裸机 → 可起服务（下权重 + 拉镜像），必须 detached 跑 |
@@ -166,9 +167,41 @@ setsid nohup ./scripts/g7e_bringup.sh > ~/bringup.log 2>&1 < /dev/null &
 `--model-path` 的 basename 反解 pipeline 类，改个名就 `module diffusers has no attribute
 MiniMaxH3ModularPipeline`。
 
+### 1.5 建交付镜像（约 2 分钟，推荐——它替掉下面第 2 / 3 步和 3.5 里的两个补丁）
+
+到这一步为止对镜像的改动已经有 8 处（2 个 `.patch` + 3 个 python 补丁 + 1 个 in-place 编辑 +
+SageAttention + 3 个 env），分散在 `serve.sh`、`build_sageattention.sh` 和几个 driver 里。
+`scripts/Dockerfile` 把它们一次性烤进镜像：
+
+```bash
+cd scripts
+./build_image.sh                 # -> h3-g7e:local，同时打 h3-g7e:<sglang sha7>
+IMAGE=h3-g7e:local ./serve.sh start   # 后面每次 serve.sh 都带上 IMAGE
+```
+
+三件事值得知道：
+
+- **base 按 digest 钉死**（`lmsysorg/sglang:nightly-dev-20260818-c0b6474b`），不是移动标签，
+  所以下面那条 `:dev` 警告在这条路上不适用。要追 HEAD：`BASE=lmsysorg/sglang:dev ./build_image.sh`，
+  但**换 base 必须重新确认补丁清单**——这条 RUN 是 `git apply` 失败即中断。
+- **`serve.sh` 自己发现清单**：镜像里写了 `/sgl-workspace/.h3-image-patches`（烤了哪些 `.patch`）和
+  `/sgl-workspace/.h3-patches/<名字>` 印戳。没有印戳的话，`serve.sh` 的 apply 循环会因为"补丁打不上"
+  在一个**已经正确**的镜像上拒绝启动。用镜像起服务时 `PATCHES` 不用传。
+- **sm_120 cubin 是建镜像时的断言**：`cuobjdump --list-elf _qattn_sm89*.so | grep sm_120` 必须命中。
+  pip 的 wheel 装出来文件名一模一样、只是没有这份 cubin，运行时静默回落 Triton（1.16× 而不是 1.776×）。
+  编译不需要 GPU（`TORCH_CUDA_ARCH_LIST=12.0` 交叉编），`MAX_JOBS=8` 下实测 117.6 s。
+
+镜像 47.3 GB。冒烟（全新容器、零手工补丁、768p turbo 8 步 5 s）：**47.242 s**，md5 与打补丁那条路
+逐字节相同；480p 8 步 14.621 s（参考 14.581 s，在 0.3% 同进程地板内）。逐位相同就是这条路
+"等价于原来那 8 处改动"的判据，不是"看起来差不多"。
+
+不烤进去的：权重（269 GB，照旧 bind mount）、NVFP4 checkpoint（在 `/out`，见 3.5）、GPU 数与并行度
+（`serve.sh` 的入参）。
+
 ### 2. 建容器并打补丁
 
-第 3 步编译 SageAttention 需要容器已经存在，所以先单独把容器和补丁做出来（**0.07 秒**）：
+（**用了 1.5 的镜像就跳过第 2、3 步和 3.5 里的两个 python 补丁**，只需要跑 `g7e_quant.sh` 出
+checkpoint。）第 3 步编译 SageAttention 需要容器已经存在，所以先单独把容器和补丁做出来（**0.07 秒**）：
 
 ```bash
 cd scripts
@@ -203,6 +236,9 @@ docker exec h3 pip show sageattention | head -2      # 应为 2.2.0
 docker commit h3 h3-sage:local
 # 以后所有 serve.sh 都带上 IMAGE=h3-sage:local
 ```
+
+（`docker commit` 出来的东西没人知道里面烤了什么——这就是 §1.5 那个 Dockerfile 存在的原因，
+它带 label、带补丁清单、带 sm_120 cubin 断言。）
 
 **编译期间不要有正在计时的请求**：nvcc 吃满 48 vCPU 会把非 DiT 那几段（VAE 出帧、封装）推上去。
 最干净是和下一步的 checkpoint 量化（也是纯 CPU）放在同一个窗口里做。

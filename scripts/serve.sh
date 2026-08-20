@@ -278,9 +278,22 @@ echo "== applying patches (idempotent)"
 # DOES_NOT_APPLY, it does not skip). On c0b6474b4 (2026-08-17) cpu-offload-inplace is UPSTREAM (its
 # own rationale comment is in decoding.py now) and target-width-height needs a re-diff, so:
 #   PATCHES="minimax-h3-short-edge.patch minimax-h3-mark-missing-params-required.patch"
+# Was PATCHES set by the caller? Captured BEFORE the default is applied, so the baked-in list below
+# can replace the default without overriding an explicit request.
+PATCHES_EXPLICIT=${PATCHES+yes}
 PATCHES=${PATCHES:-"minimax-h3-cpu-offload-inplace.patch minimax-h3-short-edge.patch \
                     minimax-h3-target-width-height.patch \
                     minimax-h3-mark-missing-params-required.patch"}
+# 容器来自 Dockerfile 建的镜像时，镜像里就写着"烤了哪些补丁"（/sgl-workspace/.h3-image-patches），
+# 用它当默认值。不这么做的话：上面那个 4 个补丁的默认列表是为 c7c03ec53b 写的，在新 base 上有两个
+# 打不上，而下面这个循环碰到 DOES_NOT_APPLY 是 `exit 1` —— 于是一个**已经完全正确**的镜像会被拒绝
+# 启动，且报错指向"image likely moved"这个错方向。
+if [ -z "$PATCHES_EXPLICIT" ] \
+   && baked=$(docker exec "$NAME" cat /sgl-workspace/.h3-image-patches 2>/dev/null) \
+   && [ -n "$baked" ]; then
+  PATCHES=$baked
+  echo "== 镜像自带补丁清单，用它（$baked）"
+fi
 docker exec "$NAME" bash -lc '
   set -e
   cd /sgl-workspace/sglang
@@ -303,21 +316,9 @@ docker exec "$NAME" bash -lc '
     fi
   done
   # The reference short edge is a single constant, so it gets rewritten in place instead of
-  # patched. A context patch for one line is fragile across image versions for no benefit: the
-  # `import os` hunk in minimax-h3-ref-image-short-edge-env.patch stopped applying the moment the
-  # file grew its own `import os` (c7c03ec53b -> 273d978bed), even though the line it cares about
-  # was untouched. Inert unless SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE is set: the default is the
-  # released 2048. This is the 1.46x lever on g7e.
-  f=python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py
-  if grep -q "^MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048$" $f; then
-    grep -q "^import os$" $f || sed -i "0,/^import math$/s//import math\nimport os/" $f
-    sed -i "s|^MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048$|MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = int(os.environ.get(\"SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE\", 2048))|" $f
-    echo "APPLIED       ref-image-short-edge env override (in-place)"
-  elif grep -q "SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE" $f; then
-    echo "ALREADY       ref-image-short-edge env override"
-  else
-    echo "DOES_NOT_APPLY ref-image-short-edge: constant not found in $f" >&2; exit 1
-  fi'
+  # patched (rationale in the script itself). The logic lives in patches/ so that this script and
+  # the Dockerfile share ONE copy of it -- both mount/copy patches/, so both can just call it.
+  bash /patches/inplace_ref_short_edge.sh'
 
 if [ -n "$PREPARE" ]; then
   echo "== container $NAME is up and patched; no server started"
