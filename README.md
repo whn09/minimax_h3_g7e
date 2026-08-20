@@ -800,17 +800,40 @@ KV 块**比例**与序列长度无关 ⇒ 保留块数 ∝ n ⇒ attention **仍
 | sol tau=1.0 | 37.909 | 1.246× | 0.8762 | 185.646 | **1.377×** | 0.8082 |
 | sol tau=1.5 | 35.178 | 1.343× | 0.8606 | 163.145 | **1.567×** | 0.7682 |
 | Cache-DiT R24（交付主力，对照） | 36.400 | 1.300× | — | 190.645 | 1.340× | 0.8928 |
-| **sol tau=1.0 + Cache-DiT R24** | | | | **148.561** | **1.720×** | 0.8182¹ |
 
-¹ 这一格的参考是**交付主力那条片**，不是 sage base。
+### 叠起来用（sol + Cache-DiT，参考 = **同片长的交付主力那条片**）
+
+| 片长 | sage + Cache-DiT R24 | sol tau=1.0 + Cache-DiT R24 | 加速 | SSIM Y | 平方项占比 |
+|---|---|---|---|---|---|
+| 5 s | 36.400 | 30.788 | 1.182× | 0.8983 | 43.5% |
+| 10 s | 99.869 | 79.994 | 1.248× | 0.8626 | 59.7% |
+| 15 s | 190.645 | **148.561** | **1.283×** | 0.8182 | 68.6% |
+
+加速随片长单调上升、SSIM 单调下降，和上面 Amdahl 的平方项占比同向 —— 这是**同一条曲线的两端**，
+不是两个独立结论。
+
+### 该用 sage 还是 sol
+
+**默认永远是 sage + Cache-DiT，全片长通用。** sol 是 15 s 长片上「愿意让一档画质换 22% 成本」时
+才动的开关，三条硬规则：
+
+1. **sol 和 sage 是二选一**（`--attention-backend` 是全局的，不能叠），所以问题永远是"这一档要不要
+   把 sage 换掉"，不是"要不要加 sol"。
+2. **永远不要单用 sol。** 10 s 单用 sol 99.52 s vs 单用 Cache-DiT 99.869 s —— **等时间**，但 SSIM
+   0.8432 vs 0.8928，等时间更差画质。5 s 上更是又慢又差。
+3. **≤5 s 不要动 sage。** 平方项只占 43.5%，1.182× 换 SSIM 0.898 不值；而且 `dense_steps` 默认 10
+   意味着 8 步配置下不显式调到 2，sol 一次都不触发（白装）。
+
+15 s 换 sol 的账：190.645 s / SSIM 0.8928 → 148.561 s / SSIM 0.8182，$/成片秒 **$0.006284 →
+$0.004897（−22%）**。0.893→0.818 是**肉眼可辨**的细节软化，所以这是商业决定不是技术默认值。
 
 1. **确实能把指数按下去**：sage n^1.576 → tau=1.0 **n^1.483** → tau=1.5 **n^1.432**。参照物是
    加第二张卡（n^1.44）—— tau=1.5 ≈ 白送一张卡的斜率，但**有损**，加卡是无损的。
 2. **单独用被 Cache-DiT 严格支配**：15 s 上几乎同加速（1.377× vs 1.340×）而 SSIM 差 **0.085**；
-   5 s 上又慢又差。
+   10 s 上等时间更差画质；5 s 上又慢又差。
 3. **画质随片长恶化**（同 tau，0.8762@5s → 0.8082@15s），Cache-DiT 不会（8 格全 0.89–0.93）。
 4. **两个能叠**：1.720× = 两者单独之积 1.845 的 **93%**（轻微稀释，cache 跳掉的整块本来也会被
-   sol 加速）。$/成片秒 15 s 768p **$0.006284 → $0.004897（−22%）**。
+   sol 加速）。
 5. 目视五行（sage / sol tau1.0 / tau1.5 / cache / sol+cache，抽第 24/120/240/340 帧）**同构图、
    同运镜、无块状 artifact、无马赛克**；掉分读作"轨迹 + 对比度/色温漂移"，与 turbo vs stock 同性质。
 
@@ -830,12 +853,15 @@ KV 块**比例**与序列长度无关 ⇒ 保留块数 ∝ n ⇒ attention **仍
 - `pip install --no-deps git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends`
   —— **必须 `--no-deps`**：它声明 torch≥2.10，不加会把镜像里的 torch 换掉。cutlass-dsl 镜像已有
   （4.6.2），sm_120 走 `cute_sm120`。
-- **`lmsysorg/sglang:dev` 上开箱即死**：`backends/sol_attn.py` 顶部无条件
+- **c0b6474（本库钉的那版）上开箱即死**：`backends/sol_attn.py` 顶部无条件
   `from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func`，而镜像里
   `flash_attn` 是**空 namespace package**（装的是 flash-attn-4）。导入惰性 ⇒ server 起得来、校验
   也过，第一次走 dense 路径才炸（`Server warmup failed: cannot import name ...`），而 dense 是
   **默认就走的**。修法 `scripts/patches/patch_sol_attn_dense_sage.py`（dense 回退换成 sage，
-  顺带让两条路径的密集参考是同一个 kernel）。这条值得给上游发 issue。
+  顺带让两条路径的密集参考是同一个 kernel）。
+  **上游已自行修掉**：`63d783bbe0`（PR #34581，2026-08-18，在 c0b6474 之后）给 sol_attn 加了
+  `dense_backend=sage_attn` 与 `_dense_sage()`。换到该 commit 之后的 base 就**不要再打这个补丁**，
+  改用 `--attention-backend-config dense_backend=sage_attn`。
 
 ```bash
 # 微基准
@@ -892,7 +918,10 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
    首次 forward 才解析 backend。必须用全局 `--attention-backend sage_attn`。
 2. **全局 sage 必须给 text encoder 豁免** `text_encoder=torch_sdpa`：Qwen3VL 的 `LocalAttention`
    只认 `{fa, torch_sdpa}`，否则起服务就死。**在 c0b6474 上要豁免三个**（加 `audio_vae`、
-   `video_vae`），见「最新 sglang」一节。
+   `video_vae`），见「最新 sglang」一节。已提 issue
+   [#35743](https://github.com/sgl-project/sglang/issues/35743)：这几个组件自己声明了
+   `default_attention_backend=torch_sdpa`，但 `--attention-backend` 一旦是命令行显式给的，
+   selector 就不走 fallback 而是直接 `ValueError` 打死 server。
 3. **`SGLANG_USE_RUNAI_MODEL_STREAMER=0` 不能省**：Run:ai streamer 会攒匿名内存把主机打爆，
    关掉走 mmap。
 4. **`--attention-backend fa` 在 sm_120 会被静默降级**（gate 在 `_FlashAttentionBackendResolver`），
@@ -910,6 +939,12 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
    `H3_FP4_QKV_FIX=0` 就是关掉另一处的开关，加着不会有副作用。
    同理 `H3_FP4_TMA_SCALES=1` 只有在 `patch_nvfp4_tma_scale_layout.py` 打上之后才有意义——
    **两个 env 都是静默的**：忘了打补丁不会报错，只会出废片，所以第一次跑完必须看成片。
+   **两个补丁已提上游**：[#35739](https://github.com/sgl-project/sglang/pull/35739)（sm_120 的
+   FP4 GEMM 默认后端 + 无条件 TMA 标度布局，与模型无关）、
+   [#35740](https://github.com/sgl-project/sglang/pull/35740)（H3 侧 qkv 逐行标度重排 +
+   missing-param 策略）。合进去后这两个补丁和这两个 env 一起退休，退休判据已经验过：
+   `FP4_UPSTREAM=1 ./g7e_dev_levers.sh`（跳过补丁、三个 FP4 env 全不设）跑出的成片与打补丁那一路
+   **md5 逐位相同**（`174dcfd6…`，768p/8 步/5 s turbo NVFP4）。
 10. **g7e 按小时计费，用完就 terminate。** G 系 spot 配额默认只有 64 vCPU，抢不到多卡是配额问题
    不是容量问题；容量在 us-east-1 / eu-central-1 更好。
 11. **测 ref2va 时端口必须跟着 variant 走**：`serve.sh` 的 per-variant 默认是 fl2va→30010、

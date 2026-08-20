@@ -65,6 +65,12 @@ ARMS=${ARMS:-"base_1 cache_1 cachehq_1 adaln_1"}
 #   VARIANT=ref2va CKPT=/out/nvfp4_ref2va.safetensors \
 #     ENVX_EXTRA="SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE=1024" ./g7e_dev_levers.sh
 ENVX_EXTRA=${ENVX_EXTRA:-}
+# FP4_UPSTREAM=1：容器里的 sglang 已经自带了两个 NVFP4 修复（把它们改成上游形态、无 env 开关
+# 之后的样子）。此时既不能再打 patches/ 里那两个 python 补丁（会冲突），也不能设
+# SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND / H3_FP4_* —— 新代码里默认值和 TMA 布局都是
+# 无条件的，留着 env 等于绕过被测代码。g7e 上同配置逐格确定性，所以这一路的 md5 必须和
+# 打补丁那一路完全相同。
+FP4_UPSTREAM=${FP4_UPSTREAM:-0}
 # 输出文件名前缀。**换 VARIANT / 换卡数时一定要换 TAG**，否则 dev_base_1_768_20.mp4 会被
 # 另一个口径的同名文件覆盖，而且是静默覆盖（画质那一段照样能跑，只是比错了东西）。
 TAG=${TAG:-dev}
@@ -105,18 +111,23 @@ echo "===== G7E_DEV_LEVERS image=$IMAGE arms='$ARMS' cases='$CASES' $(date -u +%
 NAME=$NAME IMAGE=$IMAGE PATCHES="$PATCHES" ./serve.sh prepare || exit 1
 docker exec -w /tmp "$NAME" python3 -c 'import sageattention' 2>/dev/null \
   || { echo "sage 没装：先跑 NAME=$NAME ./build_sageattention.sh" >&2; exit 1; }
+if [ "$FP4_UPSTREAM" = 1 ]; then
+  echo "FP4_UPSTREAM=1：跳过两个 NVFP4 python 补丁，也不设 FP4 env（用容器里现有的代码）"
+else
 for p in patch_nvfp4_tma_scale_layout.py patch_h3_qkv_scale_reorder.py; do
   src=patches/$p; [ -f "$src" ] || src=$p
   [ -f "$src" ] || { echo "MISSING $p" >&2; exit 1; }
   docker cp "$src" "$NAME:/tmp/" >/dev/null && docker exec "$NAME" python3 "/tmp/$p" || exit 1
 done
+fi
 docker exec "$NAME" bash -lc 'python3 -c "import sglang;print(\"sglang\", sglang.__version__)"' 2>/dev/null | tail -1
 
 for arm in $ARMS; do
   G=${arm##*_}; KNOB=${arm%_*}
   ATTN=sage_attn   # 每个 arm 重置（sol_* 会把它换掉）
   EXTRA="--layerwise-offload-components text_encoder --transformer-weights-path $CKPT"
-  ENVX="SGLANG_USE_RUNAI_MODEL_STREAMER=0 SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=auto \
+  ENVX="SGLANG_USE_RUNAI_MODEL_STREAMER=0"
+  [ "$FP4_UPSTREAM" = 1 ] || ENVX="$ENVX SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=auto \
         H3_FP4_TMA_SCALES=1 H3_FP4_QKV_FIX=0"
   case $KNOB in
     base) ;;
