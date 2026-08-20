@@ -53,7 +53,10 @@ CASES=${CASES:-"768_20 480_20"}
 # 本地素材目录里有 input_cat.jpg 就用它（和历史表同口径），没有就退到公开样例图。跑错输入是静默的，
 # 所以 prompts.sh 会把实际用的图打成 PROMPT_PAIR 一行。
 IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo assets/first.png)}
-PORT=${PORT:-30010}
+# **端口必须跟着 VARIANT 走**：serve.sh 的 per-variant 默认是 fl2va→30010 / ref2va→30030
+# （serve.sh:120）。写死 30010 去打 ref2va 的 server 会全程 Connection refused，而 serve.sh start
+# 自己是 ready 的、脚本不报 ARM_FAILED —— 表现为整轮 rc=1、inference_time_s 空，白烧一轮 GPU。
+PORT=${PORT:-$([ "$VARIANT" = ref2va ] && echo 30030 || echo 30010)}
 SEED=${SEED:-6201}
 ARMS=${ARMS:-"base_1 cache_1 cachehq_1 adaln_1"}
 # 追加给每个 arm 的 env（不覆盖 arm 自己那组）。**ref2va 必须用它把参考短边钉到 1024**，
@@ -66,11 +69,18 @@ ENVX_EXTRA=${ENVX_EXTRA:-}
 # 另一个口径的同名文件覆盖，而且是静默覆盖（画质那一段照样能跑，只是比错了东西）。
 TAG=${TAG:-dev}
 . assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
-PROMPT=${PROMPT:-$FL2VA_PROMPT}
+# prompt 也跟着 VARIANT 走：ref2va 的那条是「Use <Picture 1> as the visual subject…」，
+# 拿 fl2va 的 prompt 去跑 ref2va 是能跑的，但等于没告诉模型那张图是主体。
+PROMPT=${PROMPT:-$([ "$VARIANT" = ref2va ] && echo "$REF2VA_PROMPT" || echo "$FL2VA_PROMPT")}
 
+# 片长（秒）。H3 按 17n+5 帧对齐：5.0 → 124 帧、10.0 → 243 帧。**换片长必须换 TAG**
+# （文件名里不带片长，否则静默覆盖）。attention 是无 mask 的 packed full self-attention，
+# 序列长度随片长线性涨、attention 项随平方涨，所以每步成本对帧数是超线性的 —— 这个旋钮就是
+# 用来量那条曲线的。
+DUR=${DUR:-5.0}
 req() {  # req <port> <short_edge> <steps> <out-tag>
   python3 h3gen.py --task "$VARIANT" --image "$IMG" --inline \
-    --short-edge "$2" --aspect 16:9 --duration 5.0 --steps "$3" --seed "$SEED" \
+    --short-edge "$2" --aspect 16:9 --duration "$DUR" --steps "$3" --seed "$SEED" \
     --flow-shift 12.0 --audio-flow-shift 3.0 --prompt "$PROMPT" --port "$1" --out "$4"; }
 
 infer_s() { python3 - "$1" <<'PY' 2>/dev/null
@@ -104,6 +114,7 @@ docker exec "$NAME" bash -lc 'python3 -c "import sglang;print(\"sglang\", sglang
 
 for arm in $ARMS; do
   G=${arm##*_}; KNOB=${arm%_*}
+  ATTN=sage_attn   # 每个 arm 重置（sol_* 会把它换掉）
   EXTRA="--layerwise-offload-components text_encoder --transformer-weights-path $CKPT"
   ENVX="SGLANG_USE_RUNAI_MODEL_STREAMER=0 SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=auto \
         H3_FP4_TMA_SCALES=1 H3_FP4_QKV_FIX=0"
@@ -125,6 +136,24 @@ for arm in $ARMS; do
                    SGLANG_CACHE_DIT_WARMUP=$w SGLANG_CACHE_DIT_SECONDARY_WARMUP=$w \
                    SGLANG_CACHE_DIT_RDT=0.$r SGLANG_CACHE_DIT_SECONDARY_RDT=0.$r" ;;
     adaln)   EXTRA="$EXTRA --minimax-h3-adaln-online --minimax-h3-adaln-plan-width 3" ;;
+    # solT<tau×10>D<dense_steps> = Sol-Attn（NVlabs/Sana @ sol-engine）。**它是全局 attention
+    # 后端，所以会把 sage 顶掉**（sage 是 fp8 QK 的，sol 是 bf16）—— 比较时必须记住这一条：
+    # 对 sage 基线的净收益 = sol 的稀疏收益 − 丢掉 fp8 的损失。
+    # 装：pip install --no-deps git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends
+    # （**必须 --no-deps**：它声明 torch>=2.10，不加会把容器里的 torch 换掉。cutlass-dsl 镜像里已有。）
+    # **dense_steps 默认 10，turbo 只有 8 步 ⇒ 默认配置下 sol 一次都不触发**（和 Cache-DiT 的
+    # warmup=4 一个坑）。tau 是 z-score（threshold = mean + tau*std），不是 top-K 预算。
+    # 还要先打 patches/patch_sol_attn_dense_sage.py，否则第一个 dense 步就炸（镜像里 flash_attn
+    # 是空 namespace package）。
+    # 结论（768p 单卡 turbo 8 步，对同片长 sage base；全表见 README「稀疏 attention」一节）：
+    #   收益随片长上升 —— tau=1.0 1.246×(5s)→1.377×(15s)、tau=1.5 1.343×→1.567×，
+    #   指数从 n^1.576 按到 n^1.483 / n^1.432（加一张卡是 n^1.44，同量级）。
+    #   **但单独用被 Cache-DiT 严格支配**：15 s 上 1.377× / SSIM 0.808 vs cache 1.340× / 0.893，
+    #   而且 sol 的画质随片长恶化（0.876@5s → 0.808@15s），cache 不会。
+    #   **两个能叠**：15 s 768p 148.561 s = 对 sage 1.720×（= 两者单独之积的 93%），$/成片秒 −22%。
+    solT*D*)   t=${KNOB#solT}; t=${t%%D*}; d=${KNOB##*D}
+             ATTN=sol_attn
+             EXTRA="$EXTRA --attention-backend-config tau=$((t/10)).$((t%10)),dense_steps=$d,dense_layers=0-1" ;;
     *) echo "SKIP unknown knob '$KNOB'"; continue ;;
   esac
   [ -n "$ENVX_EXTRA" ] && ENVX="$ENVX $ENVX_EXTRA"
@@ -132,10 +161,10 @@ for arm in $ARMS; do
   # 后端，而它只声明 ['fa','torch_sdpa']，于是全局 `--attention-backend sage_attn` 会让它
   # `Failed to load customized audio_vae`（`selector.py:300` ValueError → scheduler is dead）。
   # 三个非 DiT 组件一律 torch_sdpa（名字取自 model_index.json，**逗号分隔不是空格**）。
-  EXTRA="$EXTRA --attention-backend sage_attn \
+  EXTRA="$EXTRA --attention-backend $ATTN \
     --component-attention-backends text_encoder=torch_sdpa,audio_vae=torch_sdpa,video_vae=torch_sdpa"
 
-  echo "=== ARM $arm gpus=$G $(date -u +%H:%M:%S)"
+  echo "=== ARM $arm gpus=$G dur=$DUR $(date -u +%H:%M:%S)"
   (unset VARIANT; NAME=$NAME ./serve.sh stop) >/dev/null 2>&1
   sleep 10
   VARIANT=$VARIANT GPUS=$G ULYSSES=$G IMAGE=$IMAGE NAME=$NAME PATCHES="$PATCHES" \

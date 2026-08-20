@@ -42,7 +42,11 @@
 | **再换 Turbo LoRA 蒸馏权重，8 步（最省档，有损）** | 480p/8 | | 768p/8 | |
 | fl2va，1 卡 | 14.581 s | | 47.315 s | |
 | fl2va，1 卡 + Cache-DiT `RDT=0.24` | **11.882 s** | | **36.400 s** | |
-| 对同分辨率 stock 20 步的倍数 | 2.14× / **2.62×** | | 2.41× / **3.14×** | |
+| fl2va，2 卡 Ulysses=2 | 11.242 s | | 31.502 s | |
+| fl2va，2 卡 + Cache-DiT `RDT=0.24` | **8.983 s** | | **24.020 s** | |
+| ref2va（参考短边 1024），1 卡 + Cache-DiT `RDT=0.24` | **13.513 s** | | **37.727 s** | |
+| ref2va（参考短边 1024），2 卡 + Cache-DiT `RDT=0.24` | **10.077 s** | | **24.651 s** | |
+| 对同分辨率 stock 20 步的倍数（1 卡 / 1 卡+cache / 2 卡+cache） | 2.14× / **2.62×** / 3.47× | | 2.41× / **3.14×** / **4.75×** | |
 
 请求口径：`short_edge` 480/768 + `aspect 16:9`、`duration 5.0`（5.175 s 成片、124 帧、24 fps）、
 `flow_shift 12.0`、`audio_flow_shift 3.0`、固定 seed。**加卡只在 768p 划得来**，见「加卡」一节。
@@ -52,7 +56,8 @@
 （旧版本 H3 的 residual 读出来是 0），档位是 480p `RDT=0.20` / 768p `RDT=0.16`，
 画质数字、等成本对照（对减步数）和 $/成片秒都在「Cache-DiT」一节。
 最后一块换的是**权重本身**（Turbo LoRA 蒸馏，8 步），损得比 Cache-DiT 多一点但省得也多，
-见「Turbo LoRA」一节。
+见「Turbo LoRA」一节 —— 那一节还有 **10 s / 15 s 长片**的曲线（15 s 768p 单卡 190.6 s、
+2 卡 109.8 s，都不 OOM）和"耗时对片长为什么是超线性但远不到平方"的实测拆解。
 ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`），与早先用的第三方文件运行时
 逐 MiB、逐 0.004 s 相同，见 §3.5。
 
@@ -89,14 +94,14 @@ ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`）
 
 | 路径 | 内容 |
 |---|---|
-| `scripts/` | **部署与测量要用的 18 个**，见下表 |
-| `scripts/patches/` | 5 个 sglang 补丁（480p、width/height、CPU offload、参考短边 env、缺参策略），`serve.sh` 自动应用；外加 2 个 NVFP4 必需的源码补丁（TMA 标度布局、qkv 块标度行序），由 `g7e_nvfp4_table.sh` 应用 |
+| `scripts/` | **部署与测量要用的 21 个**，见下表 |
+| `scripts/patches/` | 5 个 sglang 补丁（480p、width/height、CPU offload、参考短边 env、缺参策略），`serve.sh` 自动应用；外加 2 个 NVFP4 必需的源码补丁（TMA 标度布局、qkv 块标度行序），由 `g7e_nvfp4_table.sh` 应用；再加 1 个只在测 sol_attn 时要打的（dense 回退换 sage，见「稀疏 attention」一节） |
 | `scripts/assets/` | 示例输入素材（都是我们自己生成的 t2va 片子切出来的，可随意用） |
 | `scripts/bench/` | 测量工具，只用来复核数字，部署不需要 |
 | `scripts/capacity/` | 抢 g7e 机器用的（spot 配额/容量探测），跑在 Jump box 上 |
 | `scripts/rejected/` | 被否掉方案的脚本（早期 NVFP4、FA4、SageAttention 3），留作证据，别照着跑 |
 
-顶层这 18 个：
+顶层这 21 个：
 
 | 脚本 | 用途 |
 |---|---|
@@ -119,6 +124,7 @@ ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`）
 | `lora_merge_transformer.py` | 把 Turbo LoRA **离线**合进 bf16 transformer（259/259 模块必须全命中），再走同一套 NVFP4 量化，见「Turbo LoRA」一节 |
 | `g7e_turbo.sh` | Turbo LoRA 那一轮的四个 phase：stock 参考 / 步数曲线 / 低 RDT（不触发）/ 高 RDT 扫描 |
 | `g7e_ref2va_provenance.sh` | 判定 ref2va 的 NVFP4 该用谁转的：自量化 / 第三方+canonicalize / BF16 真值三条腿，见 §3.5 |
+| `sol_attn_micro.py` | Sol-Attn 的孤立微基准（H3 DiT 形状，不用起 server）：扫 tau × 片长，复算保留块比例，见「稀疏 attention」一节 |
 | `pull_results_loop.sh` | 在笔记本上边跑边拉结果（spot 会被回收，别等跑完再拉） |
 
 `scripts/bench/` 里的 7 个是复核用的：`attn_bench_sage.py`（attention 单点，H3 真实形状
@@ -628,6 +634,90 @@ turbo 单独用就已经比之前最好的加速档（20 步 + Cache-DiT，768p 
 推荐 **8 步 + `RDT=0.24`**，不推荐 R32：再快 17%，但 768p SSIM 从 0.8848 掉到 0.8606，
 掉出 Cache-DiT 交付档 ~0.92 那个量级。
 
+### 2 卡（Ulysses=2，5 s）
+
+turbo 把每步压薄了，加卡收益**没有**被稀释：
+
+| 档 | 1 卡 | 2 卡 | 加卡 | $/成片秒 1 卡 → 2 卡 |
+|---|---|---|---|---|
+| 480p stock 20 步 | 31.137 | 25.127 | 1.24× | $0.002991 → $0.004828 |
+| 480p turbo 8 步 | 14.581 | 11.242 | 1.30× | $0.001401 → $0.002160 |
+| **480p turbo 8 步 + `RDT=0.24`** | **11.882** | **8.983** | **1.32×** | **$0.001142 → $0.001726** |
+| 768p stock 20 步 | 114.155 | 77.257 | 1.48× | $0.010967 → $0.014844 |
+| 768p turbo 8 步 | 47.315 | 31.502 | 1.50× | $0.004546 → $0.006053 |
+| **768p turbo 8 步 + `RDT=0.24`** | **36.400** | **24.020** | **1.52×** | **$0.003497 → $0.004615** |
+
+加卡倍数沿 stock → turbo → turbo+cache **单调微升**（480p 1.24→1.30→1.32、768p 1.48→1.50→1.52）：
+turbo 减的是步数、cache 跳的是整块（连那一块的 all-to-all 一起跳），每步的算力:通信比没变。
+对比 sage —— 它只压算力不压通信，768p 加卡从 1.62× 掉到 1.50×。
+
+累计：768p 114.155 s → 36.400 s（单卡 3.14×）→ **24.020 s（2 卡 4.75×）**。2 卡买的是延迟，
+单价仍然更高，单卡永远是最便宜的一档。
+
+### ref2va（同一份 LoRA 合进 Ref2VA 分区）
+
+**LoRA 库里没有 ref2va 专用权重**（整库只有 t2v 命名的文件），但同一份 `v4_step600_ema` 合进
+Ref2VA 分区就能用：merged 259/259、最大 |delta|/|W| = 0.0036、量化 worst rel 0.0950，与 fl2va 同量级。
+
+```bash
+docker exec -e SRC=/models/MiniMax-H3/Ref2VA/transformer \
+  -e LORA=/out/lora/minimax_h3_turbo_v4_step600_ema.safetensors \
+  -e DST=/out/turbo_ref2va_bf16 h3n python3 /tmp/lora_merge_transformer.py
+docker exec -e SRC=/out/turbo_ref2va_bf16 -e DST=/out/nvfp4_ref2va_turbo.safetensors \
+  h3n python3 /tmp/nvfp4_quantize_transformer.py
+```
+
+| 档（参考短边 1024） | 480p 1 卡 | 480p 2 卡 | 768p 1 卡 | 768p 2 卡 |
+|---|---|---|---|---|
+| stock NVFP4 20 步 | 36.489 | 28.814 | 118.836 | 79.317 |
+| turbo 8 步 | 16.712 | 12.696 | 49.056 | 32.301 |
+| **turbo 8 步 + `RDT=0.24`** | **13.513** | **10.077** | **37.727** | **24.651** |
+| 对同卡数 stock 20 步 | 2.18× / **2.70×** | 2.27× / 2.86× | 2.42× / **3.15×** | 2.46× / **3.22×** |
+| $/成片秒（8 步 + `RDT=0.24`） | **$0.001298** | $0.001936 | **$0.003624** | $0.004736 |
+
+倍数比 fl2va 还略高（fl2va 2.62× / 3.14×），因为参考图编码那份固定开销不随步数缩；绝对时间比
+fl2va 贵 3.6%（768p）–14%（480p）。同轮 stock 20 步与顶部交付表逐格吻合（0.2% 内）。
+
+**ref2va 的 SSIM 不能当画质判据**：只给主体图、不给首帧，构图和运镜本身就允许不同，
+motion 能量 0.78–1.36（fl2va 只有 0.34–0.52），运动一大、逐像素相关度就被打穿 ——
+对 stock 20 步只有 0.59–0.86。目视四帧对照（stock 20 步 / turbo 8 步 / turbo 8 步+R24 三行）
+是同构图、同光照、猫的品种与花纹一致、毛发细节一致，无 artifact、无糊、无闪烁。
+
+### 片长曲线（attention 的平方项到底占多少）
+
+attention 是**无 mask 的 packed full self-attention**（视频 + 音频 token 全打在一起），
+所以那一项确实随片长平方涨；但 QKV/O 投影和 SwiGLU FFN（28672）是线性的，固定开销还会随片长摊薄。
+帧数按 17n+5 对齐、24 fps：5.0 s→124 帧 / 10.0 s→243 帧 / 15.0 s→362 帧（比值 1 : 1.960 : 2.919）。
+
+turbo 8 步载体，`+ cache RDT=0.24` 是交付主力档：
+
+| | 480p 1 卡 | 480p 2 卡 | 加卡 | 768p 1 卡 | 768p 2 卡 | 加卡 |
+|---|---|---|---|---|---|---|
+| **base** 5 s | 14.581 | 11.242 | 1.30× | 47.315 | 31.502 | 1.50× |
+| **base** 10 s | 34.172 | 23.621 | 1.45× | 132.419 | 79.045 | 1.68× |
+| **base** 15 s | 61.240 | 39.734 | 1.54× | 255.412 | 147.657 | 1.73× |
+| **+cache** 5 s | **11.882** | 8.983 | 1.32× | **36.400** | 24.020 | 1.52× |
+| **+cache** 10 s | **27.086** | 18.497 | 1.46× | **99.869** | 59.320 | 1.68× |
+| **+cache** 15 s | **47.698** | 30.753 | 1.55× | **190.645** | 109.758 | 1.74× |
+
+$/成片秒（交付主力档）：480p 1 卡 $0.001142 / $0.001330 / $0.001572（5/10/15 s），2 卡 $0.001726 /
+$0.001817 / $0.002027；768p 1 卡 $0.003497 / $0.004904 / $0.006284，2 卡 $0.004615 / $0.005826 /
+$0.007236。
+
+1. **超线性，但远不到平方。** 按帧数比取指数：480p 单卡 n^1.27（10 s）/ n^1.34（15 s），
+   768p 单卡 n^1.53 / n^1.57。纯 O(n²) 时 15 s 该是 5 s 的 8.52×，实测 480p 4.20× / 768p 5.40×。
+   768p 指数更高，因为 token 更多、平方项占比更大。
+2. **加卡是长片的解，而且越长越划算。** Ulysses 切的正是序列轴，2 卡时每卡的平方项降到 1/4，
+   加卡倍数随片长单调上升：480p 1.30→1.45→1.54，768p 1.50→1.68→**1.73（效率 87%）**；
+   等价说法是 2 卡把指数按下去：768p n^1.57 → **n^1.44**。零代码改动。
+3. **Cache-DiT 在长片上更值钱**（不是被稀释）：480p 1.23×→1.26×→1.28×，768p 1.30×→1.33×→1.34×。
+4. **15 s / 768p 单卡不 OOM**：52.6 GB（base）/ 55.5 GB（+cache，多存 residual），2 卡峰值 64.3–64.7 GB。
+5. 长片上 cache 的**增量损失不恶化**：对同片长同卡数的 turbo base，8 格 SSIM Y 全在 0.89–0.93
+   （768p/15 s 最低 0.8908），motion 一律被 cache 压低一点，与 5 s 的机制一致。
+
+要真正改掉那个指数只能换 sparse/block attention 或者分段生成（便宜但有接缝与漂移风险）。
+前者已实测，见下面「稀疏 attention」一节：能把指数从 n^1.57 按到 n^1.43，但有损。
+
 ### 画质怎么读（三条）
 
 1. **SSIM 0.88–0.90 是"另一条轨迹"不是"差 10%"。** 同口径对照：stock 自己减到 10 步是
@@ -664,6 +754,111 @@ turbo 8 步 base 跨 3 个 arm、跨 server 重启量了 3 次：480p 14.597 / 1
 
 跑法：`PHASES="tb0 tbo tbc tbc2" ./g7e_turbo.sh`（四个 phase 一个 TAG，别共用 TAG，同名 mp4 会静默覆盖）。
 
+## 稀疏 attention（sol_attn）——长片的可选加速档
+
+一句话：**能用、收益随片长上升、单独用被 Cache-DiT 支配、但两个能叠。** 15 s / 768p 单卡从交付
+主力的 190.645 s 压到 **148.561 s（对 sage 基线 1.720×，$/成片秒 −22%）**，代价 SSIM 0.818。
+
+### 能挂到 H3 上的稀疏后端只有 2 个
+
+判据还是那条 `packed_varlen`（后端类有没有覆写 `forward_varlen`，见上一节）。c0b6474 的 20 个
+后端里实现了它的只有 6 个，稀疏的只有 2 个：
+
+| 后端 | 能挂 | 状态 |
+|---|---|---|
+| `subblock_sparse_attn` | ✓ | **上游专门在 MiniMax-H3 上调过参**（docstring 就是 H3 t2va 37.7k token：sparsity 0.75→1.14× / 0.85→1.21×，并明确写了会饱和），但 blk64 kernel 只编 `sm_100a`、resolver 的 `required_capability = (10, 0)` 是**严格相等** ⇒ g7e(12.0) 与 B300(10.3) 都开不了，只有 B200/GB200。 |
+| `sol_attn` | ✓ | NVlabs/Sana @ `sol-engine` 的 `techniques/sparse_backends`，本节测的这个。 |
+| VSA / VMoBA / STA / SVG2(SAP) / block-sparse(Laser) / RainFusion / SLA | ✗ | 缺 `forward_varlen`。**补它对 H3 很便宜**：每次只有一条 packed 序列 ⇒ `q.unsqueeze(0)` 再调自己的 forward，约 15 行。 |
+
+### 为什么"有优化但达不到线性"（源码 + 微基准双证）
+
+`sol_attn/triton_ref/preprocess.py:_diag_threshold_kernel` 最后一行是
+`threshold = mean + TAU * std` —— **tau 是 z-score，不是 top-K 预算**。z-score 固定 ⇒ 超阈值的
+KV 块**比例**与序列长度无关 ⇒ 保留块数 ∝ n ⇒ attention **仍是 O(n²)**，只是常数被除小。
+
+`scripts/sol_attn_micro.py`（不用起 server，H3 DiT 形状 56 头 / dim 128 / bf16 / 一条 packed 序列）：
+
+| 后端 | 5 s (39760 tok) | 15 s (116060) | 15s/5s | 隐含指数 | 保留块 5s → 15s |
+|---|---|---|---|---|---|
+| sageattn（交付基线） | 67.66 ms | 566.29 ms | 8.37× | n^1.98 | 密集 |
+| sol tau=1.0（默认） | 23.66 | 198.01 | 8.37× | n^1.98 | 15.1% → **15.1%** |
+| sol tau=1.5 | 12.34 | 96.94 | 7.86× | n^1.92 | 6.1% → **6.1%** |
+| sol tau=2.0 | 7.30 | 49.74 | 6.81× | n^1.79 | 1.9% → **1.9%** |
+
+**保留比例在两个片长上一位不差地相同，对 sage 的加速比也一样（2.859× vs 2.860×）** —— 它把 y 轴
+按比例压下来，没动斜率。（随机高斯 q/k 的尾比真实激活轻，所以这是乐观上限，E2E 只拿到 ~77%。）
+
+第二层原因是 Amdahl：用上面片长曲线的三个 768p 单卡点拟合 `T = 20.57n² + 27.80n`（n=1 即 5 s，
+常数项 ≈ 0）⇒ 平方项占比 5 s **43.5%** / 10 s 59.7% / 15 s **68.6%**。**5 s 上 attention 全免费
+也只值 1.77×——稀疏 attention 是长片的工具。**
+
+### E2E（768p 单卡 turbo 8 步，`dense_steps=2`，参考 = 同片长 sage base）
+
+| 臂 | 5 s | 对 sage | SSIM Y | 15 s | 对 sage | SSIM Y |
+|---|---|---|---|---|---|---|
+| sage（交付基线） | 47.231 | 1.00× | — | 255.56 | 1.00× | — |
+| sol tau=1.0 | 37.909 | 1.246× | 0.8762 | 185.646 | **1.377×** | 0.8082 |
+| sol tau=1.5 | 35.178 | 1.343× | 0.8606 | 163.145 | **1.567×** | 0.7682 |
+| Cache-DiT R24（交付主力，对照） | 36.400 | 1.300× | — | 190.645 | 1.340× | 0.8928 |
+| **sol tau=1.0 + Cache-DiT R24** | | | | **148.561** | **1.720×** | 0.8182¹ |
+
+¹ 这一格的参考是**交付主力那条片**，不是 sage base。
+
+1. **确实能把指数按下去**：sage n^1.576 → tau=1.0 **n^1.483** → tau=1.5 **n^1.432**。参照物是
+   加第二张卡（n^1.44）—— tau=1.5 ≈ 白送一张卡的斜率，但**有损**，加卡是无损的。
+2. **单独用被 Cache-DiT 严格支配**：15 s 上几乎同加速（1.377× vs 1.340×）而 SSIM 差 **0.085**；
+   5 s 上又慢又差。
+3. **画质随片长恶化**（同 tau，0.8762@5s → 0.8082@15s），Cache-DiT 不会（8 格全 0.89–0.93）。
+4. **两个能叠**：1.720× = 两者单独之积 1.845 的 **93%**（轻微稀释，cache 跳掉的整块本来也会被
+   sol 加速）。$/成片秒 15 s 768p **$0.006284 → $0.004897（−22%）**。
+5. 目视五行（sage / sol tau1.0 / tau1.5 / cache / sol+cache，抽第 24/120/240/340 帧）**同构图、
+   同运镜、无块状 artifact、无马赛克**；掉分读作"轨迹 + 对比度/色温漂移"，与 turbo vs stock 同性质。
+
+### 四个旋钮 + 两个装它的坑
+
+全走 `--attention-backend-config`（JSON / 文件 / `k=v` 都行；`dense_layers` 带逗号，用 `k=v` 时
+写成范围 `0-1` 避开分隔符）。
+
+1. **`dense_steps` 默认 10** —— 前 10 个去噪步强制密集，**跑 ≤10 步（turbo/蒸馏）时 sol 一次都不
+   触发**，20 步也只有一半在省。和 Cache-DiT 的 `warmup=4` 是同一个坑。8 步设 2。
+2. **`tau`** 是主旋钮（默认 1.0 ≈ 保留 15%）。
+3. **`sink_tokens` / `sink_start` 默认 0** —— H3 把文本 token 打进同一条无 mask 的 packed 序列，
+   默认配置下**文本 token 也会被剪**；钉成 exact sink 是免费的画质保险。
+4. **`kv_splits` 是陷阱**：`interface.py:_validate_cute` 对 `arch != (9,0)` 且 `kv_splits != 1`
+   直接 raise，只有 H100 且 seq ≥ 65536 才自动开 4（所以 H100 上长片相对更省）。
+
+- `pip install --no-deps git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends`
+  —— **必须 `--no-deps`**：它声明 torch≥2.10，不加会把镜像里的 torch 换掉。cutlass-dsl 镜像已有
+  （4.6.2），sm_120 走 `cute_sm120`。
+- **`lmsysorg/sglang:dev` 上开箱即死**：`backends/sol_attn.py` 顶部无条件
+  `from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func`，而镜像里
+  `flash_attn` 是**空 namespace package**（装的是 flash-attn-4）。导入惰性 ⇒ server 起得来、校验
+  也过，第一次走 dense 路径才炸（`Server warmup failed: cannot import name ...`），而 dense 是
+  **默认就走的**。修法 `scripts/patches/patch_sol_attn_dense_sage.py`（dense 回退换成 sage，
+  顺带让两条路径的密集参考是同一个 kernel）。这条值得给上游发 issue。
+
+```bash
+# 微基准
+docker cp scripts/sol_attn_micro.py h3n:/tmp/ && docker exec h3n python3 /tmp/sol_attn_micro.py
+# E2E：arm 名 solT<tau×10>D<dense_steps>
+TAG=sol15 DUR=15.0 ARMS="base_1 solT10D2_1 solT15D2_1" CASES="768_8" \
+  CKPT=/out/nvfp4_fl2va_turbo.safetensors ./g7e_dev_levers.sh
+# 叠 Cache-DiT（cache 走 env，不用新 knob）
+TAG=sol15c DUR=15.0 ARMS="solT10D2_1" CASES="768_8" CKPT=/out/nvfp4_fl2va_turbo.safetensors \
+  ENVX_EXTRA="SGLANG_CACHE_DIT_ENABLED=1 SGLANG_CACHE_DIT_WARMUP=2 \
+              SGLANG_CACHE_DIT_SECONDARY_WARMUP=2 SGLANG_CACHE_DIT_RDT=0.24 \
+              SGLANG_CACHE_DIT_SECONDARY_RDT=0.24" ./g7e_dev_levers.sh
+```
+
+### 真想动阶数，只有两条路
+
+- **把固定比例改成固定预算**：让 tau 跟片长涨，分数近似高斯时保住块数恒定需要
+  `tau(n) ≈ tau₀ + √(2·ln(n/n₀))`。纯配置、不碰 kernel；但会把"画质随片长恶化"进一步推高。
+- **给一个真·线性的后端补 `forward_varlen`**：STA 是固定 3D 窗口 = O(n·w)，VSA 是固定 top-k 块，
+  两个都真降阶，对 H3 各约 15 行，也能顺手给上游发 PR。
+
+**无损的那条已经在手上**：Ulysses 切的正是序列轴，加卡把 768p 从 n^1.576 按到 n^1.44，越长越划算。
+
 ## sglang 的并行旋钮（源码核对 + 实测）
 
 我们跑的配置里这些默认全是关的（从 serve 日志的 `server_args` 读）：
@@ -677,7 +872,7 @@ turbo 8 步 base 跨 3 个 arm、跨 server 重启量了 3 次：480p 14.597 / 1
 | `--cfg-parallel-size` | **H3 用不了**：`configs/pipeline_configs/minimax_h3.py` 写死 `supports_cfg_parallel=False`，checkpoint 是 CFG 蒸馏的、只有一条正分支。 |
 | `--enable-breakable-cuda-graph` | 把 DiT forward 抓成 CUDA graph 段（在 attention 处断开），省 kernel launch 开销、数值无损。**g7e 单卡实测起不来**（`g7e_levers.sh` 的 `bcg_1`）：warmup 阶段 `CUDA error: device-side assert triggered`，从 `layerwise_offload.py:317 prefetch_layer` 的 `copy_stream.wait_stream(...)` / `event.record(stream)` 冒出来，随后 `Server warmup failed; aborting startup` —— 和 g7e 上强制的 text encoder layerwise offload 撞。B300 上 8 卡能起但**白开**（768p 噪声内、480p 慢 3.8%，多吃 35 GB），1 卡也崩（那边是 `illegal memory access`）。结论：H3 的 DiT 不是 launch-bound。 |
 | `--enable-torch-compile` | 与上一条互斥，且 flag 自己的帮助文本写了 "will likely cause precision drifts"。 |
-| `--attention-backend <后端>` | **H3 的 DiT 走 packed varlen（视频+音频 token 拼成一条不定长序列），所以能选的后端只有 5 个**：`sage_attn`（交付用的 sage 2）、`fa`（sm_120 上被静默降级）、`torch_sdpa`、`sol_attn`、`subblock_sparse_attn`（要 sm_100a，这张卡不行）。判据是 impl 有没有覆写 `forward_varlen`（`backends/attention_backend.py:45`），不满足的在 `minimax_h3.py:192 validate_server_args` 就 `ValueError` 起不来。所以 `sage_attn_3` / `video_sparse_attn` / `vmoba` / `block_sparse_attn` / `sliding_tile_attn` 等**全部对 H3 不可用**，见「被否掉的方案」。 |
+| `--attention-backend <后端>` | **H3 的 DiT 走 packed varlen（视频+音频 token 拼成一条不定长序列），所以能选的后端只有 5 个**：`sage_attn`（交付用的 sage 2）、`fa`（sm_120 上被静默降级）、`torch_sdpa`、`sol_attn`、`subblock_sparse_attn`（要 sm_100a，这张卡不行）。判据是 impl 有没有覆写 `forward_varlen`（`backends/attention_backend.py:45`），不满足的在 `minimax_h3.py:192 validate_server_args` 就 `ValueError` 起不来。所以 `sage_attn_3` / `video_sparse_attn` / `vmoba` / `block_sparse_attn` / `sliding_tile_attn` 等**全部对 H3 不可用**，见「被否掉的方案」。稀疏那两个的实测见「稀疏 attention」一节。 |
 
 `serve.sh` 的补丁列表在镜像前进后要收窄（这个循环碰到 `DOES_NOT_APPLY` 是 `exit 1`，不是跳过）。
 在 sglang `c0b6474b4` 上 cpu-offload-inplace 已进上游、target-width-height 需要重新 diff：
@@ -717,6 +912,12 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
    **两个 env 都是静默的**：忘了打补丁不会报错，只会出废片，所以第一次跑完必须看成片。
 10. **g7e 按小时计费，用完就 terminate。** G 系 spot 配额默认只有 64 vCPU，抢不到多卡是配额问题
    不是容量问题；容量在 us-east-1 / eu-central-1 更好。
+11. **测 ref2va 时端口必须跟着 variant 走**：`serve.sh` 的 per-variant 默认是 fl2va→30010、
+   ref2va→30030（`serve.sh:120`）。拿 30010 去打一个 ref2va 的 server，全程
+   `Connection refused`，而 `serve.sh start` 自己是 ready 的、消融脚本也不报 `ARM_FAILED`，
+   表现只是整轮 `rc=1` + `inference_time_s` 空 —— 白烧一轮 GPU 才发现。
+   `g7e_dev_levers.sh` 现在按 `$VARIANT` 推 `PORT`（prompt 也一样按 variant 推，
+   ref2va 那条是「Use \<Picture 1\> as the visual subject…」）。
 
 ## 被否掉的方案
 
@@ -732,7 +933,9 @@ broker），间隔 1 会静默撞死成 hang。`serve.sh` 默认带 `--strict-po
   → `ValueError: Attention backend 'sage_attn_3' does not implement packed varlen attention`，
   **是报错不是静默回落**（早先写的"装不上会静默降级 TORCH_SDPA"是错的，H3 在参数校验阶段就先拒了）。
   要它能用只能给上游的 `backends/sage_attn3.py` 实现 `forward_varlen`。脚本留在
-  `scripts/rejected/build_sageattention3.sh`。同一条判据也封掉了所有稀疏 attention 后端。
+  `scripts/rejected/build_sageattention3.sh`。同一条判据也封掉了 20 个后端里的 14 个 ——
+  **但稀疏后端里有 2 个是过关的**（`sol_attn` 可用、`subblock_sparse_attn` 要 sm_100a），
+  见「稀疏 attention」一节。
 - **DiT cache / 跳步**：外挂的三套（TeaCache 等）层次上接不上 H3。sglang **自带**的 Cache-DiT 在
   c0b6474 上真挂上了：20 步 1.6×、**30 步 2.1–2.3×**（4 个配置全量过），等成本口径下**优于减步数**
   （30 步 6/6 全赢，最大 +0.032 SSIM），而且是**唯一不稀释加卡收益**的加速手段——**可选加速档**，
