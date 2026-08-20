@@ -56,6 +56,15 @@ IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo as
 PORT=${PORT:-30010}
 SEED=${SEED:-6201}
 ARMS=${ARMS:-"base_1 cache_1 cachehq_1 adaln_1"}
+# 追加给每个 arm 的 env（不覆盖 arm 自己那组）。**ref2va 必须用它把参考短边钉到 1024**，
+# 否则默认 2048 → 参考图编码像素是交付表口径的 4 倍，480p/20 会从 36 s 变成 65 s，
+# 看着像"优化变慢了"其实是换了口径：
+#   VARIANT=ref2va CKPT=/out/nvfp4_ref2va.safetensors \
+#     ENVX_EXTRA="SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE=1024" ./g7e_dev_levers.sh
+ENVX_EXTRA=${ENVX_EXTRA:-}
+# 输出文件名前缀。**换 VARIANT / 换卡数时一定要换 TAG**，否则 dev_base_1_768_20.mp4 会被
+# 另一个口径的同名文件覆盖，而且是静默覆盖（画质那一段照样能跑，只是比错了东西）。
+TAG=${TAG:-dev}
 . assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
 PROMPT=${PROMPT:-$FL2VA_PROMPT}
 
@@ -112,6 +121,7 @@ for arm in $ARMS; do
     adaln)   EXTRA="$EXTRA --minimax-h3-adaln-online --minimax-h3-adaln-plan-width 3" ;;
     *) echo "SKIP unknown knob '$KNOB'"; continue ;;
   esac
+  [ -n "$ENVX_EXTRA" ] && ENVX="$ENVX $ENVX_EXTRA"
   # c0b6474 上要豁免的组件比 273d978be **多**：新镜像里 audio_vae 也去 selector 解 attention
   # 后端，而它只声明 ['fa','torch_sdpa']，于是全局 `--attention-backend sage_attn` 会让它
   # `Failed to load customized audio_vae`（`selector.py:300` ValueError → scheduler is dead）。
@@ -123,16 +133,16 @@ for arm in $ARMS; do
   (unset VARIANT; NAME=$NAME ./serve.sh stop) >/dev/null 2>&1
   sleep 10
   VARIANT=$VARIANT GPUS=$G ULYSSES=$G IMAGE=$IMAGE NAME=$NAME PATCHES="$PATCHES" \
-    ENVX="$ENVX" EXTRA="$EXTRA" LOG=$COUT/serve_dev_$arm.log ./serve.sh start \
-    > "$OUT/start_dev_$arm.log" 2>&1 \
-    || { echo "ARM_FAILED $arm （看 $OUT/serve_dev_$arm.log）"
-         docker exec "$NAME" bash -lc "tr '\r' '\n' < $COUT/serve_dev_$arm.log | grep -iE 'error|raise|Traceback' | tail -5" 2>/dev/null
+    ENVX="$ENVX" EXTRA="$EXTRA" LOG=$COUT/serve_${TAG}_$arm.log ./serve.sh start \
+    > "$OUT/start_${TAG}_$arm.log" 2>&1 \
+    || { echo "ARM_FAILED $arm （看 $OUT/serve_${TAG}_$arm.log）"
+         docker exec "$NAME" bash -lc "tr '\r' '\n' < $COUT/serve_${TAG}_$arm.log | grep -iE 'error|raise|Traceback' | tail -5" 2>/dev/null
          continue; }
-  for w in 480 768; do req "$PORT" "$w" 4 "warm_dev_${arm}_$w" >/dev/null 2>&1; done
+  for w in 480 768; do req "$PORT" "$w" 4 "warm_${TAG}_${arm}_$w" >/dev/null 2>&1; done
   echo "== $arm warm $(date -u +%H:%M:%S)"
   for c in $CASES; do
     se=${c%_*}; st=${c#*_}
-    name="dev_${arm}_${se}_${st}"
+    name="${TAG}_${arm}_${se}_${st}"
     t0=$(date +%s)
     req "$PORT" "$se" "$st" "$name" > "${name}_client.log" 2>&1
     rc=$?; t1=$(date +%s)
@@ -140,18 +150,20 @@ for arm in $ARMS; do
   done
   # 回读真正落地的东西：attention 后端（sm_120 上 fa 会被静默降级）+ Cache-DiT 到底挂上没有
   # （"Acceleration hooks is disabled for: BlockAdapter" = 没挂上，别把噪声当收益）。
-  docker exec "$NAME" bash -lc "tr '\r' '\n' < $COUT/serve_dev_$arm.log | grep -oiE 'Enabling cache-dit[^\"]{0,120}|Acceleration hooks is disabled[^\"]{0,40}|SCM enabled[^\"]{0,80}|sage[a-z0-9_]*|\"attention_backend\": [^,]*' | sort -u | head -10" 2>/dev/null
+  docker exec "$NAME" bash -lc "tr '\r' '\n' < $COUT/serve_${TAG}_$arm.log | grep -oiE 'Enabling cache-dit[^\"]{0,120}|Acceleration hooks is disabled[^\"]{0,40}|SCM enabled[^\"]{0,80}|sage[a-z0-9_]*|\"attention_backend\": [^,]*' | sort -u | head -10" 2>/dev/null
 done
 (unset VARIANT; NAME=$NAME ./serve.sh stop) >/dev/null 2>&1
 
-# 画质：新镜像的 base_1 当参考（同镜像同卡数，唯一变量是那个旋钮）。单卡同 seed 重跑逐位相同，
+# 画质：**同卡数**的 base 当参考（同镜像同卡数，唯一变量是那个旋钮）。同 seed 同卡数重跑逐位相同，
 # 所以无损旋钮应当 SSIM 1.000000；cache_* 是有损的，这里量的就是损多少。
+# 跨卡数比没意义（Ulysses 换了 reduce 顺序，base_2 vs base_1 本身就不逐位相同）。
 for c in $CASES; do
   se=${c%_*}; st=${c#*_}
   for arm in $ARMS; do
-    [ "${arm##*_}" = 1 ] && [ "$arm" != base_1 ] || continue
-    [ -f "dev_base_1_${se}_${st}.mp4" ] && [ -f "dev_${arm}_${se}_${st}.mp4" ] && \
-      RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "dev_base_1_${se}_${st}" "dev_${arm}_${se}_${st}"
+    G=${arm##*_}
+    [ "$arm" != "base_$G" ] || continue
+    [ -f "${TAG}_base_${G}_${se}_${st}.mp4" ] && [ -f "${TAG}_${arm}_${se}_${st}.mp4" ] && \
+      RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "${TAG}_base_${G}_${se}_${st}" "${TAG}_${arm}_${se}_${st}"
   done
 done
 echo "G7E_DEV_LEVERS_DONE $(date -u +%FT%TZ)"
