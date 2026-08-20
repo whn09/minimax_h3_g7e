@@ -25,11 +25,17 @@
 set -u
 cd "${WORKDIR:-$(cd "$(dirname "$0")" && pwd)}"
 IMAGE=${IMAGE:-lmsysorg/sglang:h3-validated}   # 不用 :dev，那是会移动的 tag（g7e_bringup.sh 会建这个固定 tag）
+# quality_pair.sh 要 docker exec 进容器拿 ffmpeg，容器名不传就默认 h3 —— 名字不对时三个探针
+# 全把 stderr 吞掉，画质列静默变成 motion=n/a、没有 SSIM。所以这里显式定，并往下传。
+NAME=${NAME:-h3}
 OUT=/opt/dlami/nvme/out
 TASK=${TASK:-fl2va}
 CASES=${CASES:-"480_20 480_30 768_20 768_30"}
-IMG=${IMG:-assets/first.png}
+# 本地素材目录里有 input_cat.jpg 就用它（和历史表同口径），没有就退到公开样例图。跑错输入是静默的，
+# 所以 prompts.sh 会把实际用的图打成 PROMPT_PAIR 一行。
+IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo assets/first.png)}
 mkdir -p "$OUT"
+. assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
 
 # 每个 task 一套口径：端口由 serve.sh 按 variant 定（fl2va 30010 / ref2va 30030），seed 分开是为了
 # 两个 task 的成片互不覆盖，参考短边只有 ref2va 有意义（上游默认 2048，1024 是我们的杠杆，
@@ -37,11 +43,11 @@ mkdir -p "$OUT"
 case $TASK in
   fl2va)
     PORT=30010; SEED=${SEED:-6201}; TAGMID=""; REFENV=""
-    PROMPT=${PROMPT:-"A white cat sitting on an open window ledge slowly turns its head toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Natural afternoon light, subtle street ambience and soft paw sounds, realistic motion, static cinematic camera."} ;;
+    PROMPT=${PROMPT:-$FL2VA_PROMPT} ;;
   ref2va)
     PORT=30030; SEED=${SEED:-8201}; REF_SHORT_EDGE=${REF_SHORT_EDGE:-1024}
     TAGMID="_r${REF_SHORT_EDGE}"; REFENV="SGLANG_MINIMAX_H3_REF_IMAGE_SHORT_EDGE=$REF_SHORT_EDGE"
-    PROMPT=${PROMPT:-"Use <Picture 1> as the visual subject. The same white cat sits beside an open window, slowly turns toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Preserve the cat's identity and markings, natural afternoon light, realistic coherent motion, synchronized soft ambience, static cinematic camera."} ;;
+    PROMPT=${PROMPT:-$REF2VA_PROMPT} ;;
   *) echo "TASK must be fl2va|ref2va" >&2; exit 2 ;;
 esac
 
@@ -94,6 +100,6 @@ run_arm 2 "" $CASES                                   # 2 卡 Ulysses=2
 # 画质：1 卡当参考，2 卡当候选。看 SSIM 是否在 0.944 的归约序地板之上、码率是否几乎不动。
 # RUNDIR 必须传：quality_pair.sh 默认指向另一条产线的目录，不传就报 MISSING。
 REF="${TASK}_768_30${TAGMID}_fp8_sage_attn_g1"; CAND="${TASK}_768_30${TAGMID}_fp8_sage_attn"
-[ -f "$REF.mp4" ] && [ -f "$CAND.mp4" ] && RUNDIR="$PWD" ./quality_pair.sh "$REF" "$CAND"
+[ -f "$REF.mp4" ] && [ -f "$CAND.mp4" ] && RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "$REF" "$CAND"
 
 echo "TWO_CARD_SAGE_DONE task=$TASK $(date -u +%FT%TZ)"

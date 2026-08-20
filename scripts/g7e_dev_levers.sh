@@ -50,11 +50,14 @@ COUT=/out
 VARIANT=${VARIANT:-fl2va}
 CKPT=${CKPT:-$COUT/nvfp4_fl2va.safetensors}
 CASES=${CASES:-"768_20 480_20"}
-IMG=${IMG:-assets/first.png}
+# 本地素材目录里有 input_cat.jpg 就用它（和历史表同口径），没有就退到公开样例图。跑错输入是静默的，
+# 所以 prompts.sh 会把实际用的图打成 PROMPT_PAIR 一行。
+IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo assets/first.png)}
 PORT=${PORT:-30010}
 SEED=${SEED:-6201}
 ARMS=${ARMS:-"base_1 cache_1 cachehq_1 adaln_1"}
-PROMPT=${PROMPT:-"A white cat sitting on an open window ledge slowly turns its head toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Natural afternoon light, subtle street ambience and soft paw sounds, realistic motion, static cinematic camera."}
+. assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
+PROMPT=${PROMPT:-$FL2VA_PROMPT}
 
 req() {  # req <port> <short_edge> <steps> <out-tag>
   python3 h3gen.py --task "$VARIANT" --image "$IMG" --inline \
@@ -148,7 +151,7 @@ for c in $CASES; do
   for arm in $ARMS; do
     [ "${arm##*_}" = 1 ] && [ "$arm" != base_1 ] || continue
     [ -f "dev_base_1_${se}_${st}.mp4" ] && [ -f "dev_${arm}_${se}_${st}.mp4" ] && \
-      RUNDIR="$PWD" ./quality_pair.sh "dev_base_1_${se}_${st}" "dev_${arm}_${se}_${st}"
+      RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "dev_base_1_${se}_${st}" "dev_${arm}_${se}_${st}"
   done
 done
 echo "G7E_DEV_LEVERS_DONE $(date -u +%FT%TZ)"

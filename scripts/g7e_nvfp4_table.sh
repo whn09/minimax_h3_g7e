@@ -47,14 +47,15 @@ NAME=${NAME:-h3}
 OUT=/opt/dlami/nvme/out          # 主机视角
 COUT=/out                        # 容器里的同一个目录
 CASES=${CASES:-"480_20 480_30 768_20 768_30"}
-IMG=${IMG:-assets/first.png}
+# 本地素材目录里有 input_cat.jpg 就用它（和历史表同口径），没有就退到公开样例图。跑错输入是静默的，
+# 所以 prompts.sh 会把实际用的图打成 PROMPT_PAIR 一行。
+IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo assets/first.png)}
 ATTN=${ATTN:-}
 FL2VA_CKPT=${FL2VA_CKPT:-$COUT/nvfp4_fl2va.safetensors}
 REF2VA_CKPT=${REF2VA_CKPT:-$COUT/nvfp4_ref2va_fixed.safetensors}
 mkdir -p "$OUT"
 
-FL2VA_PROMPT=${FL2VA_PROMPT:-"A white cat sitting on an open window ledge slowly turns its head toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Natural afternoon light, subtle street ambience and soft paw sounds, realistic motion, static cinematic camera."}
-REF2VA_PROMPT=${REF2VA_PROMPT:-"Use <Picture 1> as the visual subject. The same white cat sits beside an open window, slowly turns toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Preserve the cat's identity and markings, natural afternoon light, realistic coherent motion, synchronized soft ambience, static cinematic camera."}
+. assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
 
 # 两个补丁是**改容器里的源码**，不是 git patch，所以不走 serve.sh 那套 .patch 流程。两个脚本自己幂等
 # （已打过就打印 already patched），所以无条件跑。
@@ -151,7 +152,7 @@ done
 for variant in ${ONLY:-fl2va ref2va}; do
   mid=""; [ "$variant" = ref2va ] && mid="_r${REF_SHORT_EDGE:-1024}"
   REF="${variant}_768_30${mid}_nvfp4${ATTN:+_$ATTN}_g1"; CAND="${variant}_768_30${mid}_nvfp4${ATTN:+_$ATTN}"
-  [ -f "$REF.mp4" ] && [ -f "$CAND.mp4" ] && RUNDIR="$PWD" ./quality_pair.sh "$REF" "$CAND"
+  [ -f "$REF.mp4" ] && [ -f "$CAND.mp4" ] && RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "$REF" "$CAND"
 done
 
 echo "NVFP4_TABLE_DONE $(date -u +%FT%TZ)"

@@ -27,6 +27,18 @@ sudo chown -R "$(id -u):$(id -g)" /opt/dlami/nvme
 sudo apt-get update -qq
 sudo apt-get install -y -qq python3.12-venv ffmpeg
 
+# **必须关掉 unattended-upgrades**，否则 DLAMI 会在开机 20 分钟左右自己升包 + 重启，把整队列吃掉。
+# 2026-08-20 00:03Z 实测：升级 docker 时 docker.sock 权限翻掉 → 正在跑的 arm 报
+# "permission denied while trying to connect to the docker API"（服务日志是空的，只有 start_*.log
+# 里有那一行），紧接着 systemd-logind 广播 "The system will reboot at ..."，1 分钟后真重启。
+# spot 请求还是 fulfilled、实例还是 running，**看起来像被回收但不是**：instance store 全都还在，
+# 只是容器 Exited(137) 且里面装的 sageattention 随容器没了（docker rm -f h3n 后重建 + 重编）。
+sudo systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+sudo systemctl mask unattended-upgrades 2>/dev/null || true
+printf 'APT::Periodic::Unattended-Upgrade "0";\nAPT::Periodic::Update-Package-Lists "0";\n' \
+  | sudo tee /etc/apt/apt.conf.d/99-no-auto-upgrade >/dev/null
+sudo rm -f /var/run/reboot-required /var/run/reboot-required.pkgs
+
 [ -x $VENV/bin/hf ] || { rm -rf $VENV; python3 -m venv $VENV; $VENV/bin/pip -q install -U pip "huggingface_hub[hf_transfer,cli]"; }
 
 # Pull the image in parallel with the download -- they contend for nothing but the NIC.

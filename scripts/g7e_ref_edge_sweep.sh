@@ -23,10 +23,13 @@ COUT=/out
 CKPT=${CKPT:-$COUT/nvfp4_ref2va_fixed.safetensors}
 CASES=${CASES:-"768_20 480_20"}
 EDGES=${EDGES:-"1024 768 512"}
-IMG=${IMG:-assets/first.png}
+# 本地素材目录里有 input_cat.jpg 就用它（和历史表同口径），没有就退到公开样例图。跑错输入是静默的，
+# 所以 prompts.sh 会把实际用的图打成 PROMPT_PAIR 一行。
+IMG=${IMG:-$([ -f assets/input_cat.jpg ] && echo assets/input_cat.jpg || echo assets/first.png)}
 PORT=${PORT:-30030}
 SEED=${SEED:-8201}
-PROMPT=${PROMPT:-"Use <Picture 1> as the visual subject. The same white cat sits beside an open window, slowly turns toward the camera, blinks, and gently lifts one paw while a soft breeze moves the curtains. Preserve the cat's identity and markings, natural afternoon light, realistic coherent motion, synchronized soft ambience, static cinematic camera."}
+. assets/prompts.sh   # prompt 按 $IMG 配对，别在这里写字面量
+PROMPT=${PROMPT:-$REF2VA_PROMPT}
 
 infer_s() { python3 - "$1" <<'PY' 2>/dev/null
 import json, sys
@@ -88,7 +91,7 @@ for c in $CASES; do
   for edge in $EDGES; do
     [ "$edge" = 1024 ] && continue
     [ -f "edge1024_${se}_${st}.mp4" ] && [ -f "edge${edge}_${se}_${st}.mp4" ] && \
-      RUNDIR="$PWD" ./quality_pair.sh "edge1024_${se}_${st}" "edge${edge}_${se}_${st}"
+      RUNDIR="$PWD" NAME="$NAME" ./quality_pair.sh "edge1024_${se}_${st}" "edge${edge}_${se}_${st}"
   done
 done
 echo "REF_EDGE_SWEEP_DONE $(date -u +%FT%TZ)"

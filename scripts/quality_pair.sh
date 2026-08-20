@@ -20,12 +20,30 @@
 #
 # Same two gotchas as nvfp4_probe_quality.sh: ffmpeg/ffprobe live in the CONTAINER, and the run
 # directory is not mounted, so files are hardlinked into /opt/dlami/nvme/out (= /out) first.
+#
+# Two ways this reports NOTHING instead of failing:
+#   * wrong container name -- `NAME` must match the running container (g7e's newest-image box runs
+#     `h3n`, not `h3`). A `docker exec` into a missing container writes to stderr, which every probe
+#     here swallows, so the whole quality column comes back "motion=n/a bitrate= " with no SSIM.
+#     One full RDT sweep was scored that way before this was parameterized.
+#   * LOCAL=1 -- score already-downloaded clips with the HOST's ffmpeg (works on the laptop too):
+#       LOCAL=1 RUNDIR=~/…/runs/cache_dit ./quality_pair.sh ref cand…
+#     No docker, no /out, no sudo. Prefer this once the clips are off the box.
 set -u
 RUNDIR=${RUNDIR:-/opt/dlami/nvme/minimax_h3_h200}
+NAME=${NAME:-h3}
+LOCAL=${LOCAL:-0}
+
+# One dispatch point for all three probes: container path /out/x.mp4 vs host path $RUNDIR/x.mp4.
+FF() { # FF <ffmpeg|ffprobe> <args...>
+  if [ "$LOCAL" = 1 ]; then command "$@"; else docker exec "$NAME" "$@"; fi
+}
+P() { if [ "$LOCAL" = 1 ]; then echo "$RUNDIR/$1.mp4"; else echo "/out/$1.mp4"; fi; }
 
 link() {
   local f="$RUNDIR/$1.mp4"
   [ -f "$f" ] || { echo "MISSING $f" >&2; return 1; }
+  [ "$LOCAL" = 1 ] && return 0
   # A hardlink only works when RUNDIR is on the same filesystem as /opt/dlami/nvme; RUNDIR=$HOME
   # (where the sweep scripts write) is not, and `ln` fails with EXDEV. Copy in that case.
   sudo ln -f "$f" /opt/dlami/nvme/out/ 2>/dev/null || sudo cp -f "$f" /opt/dlami/nvme/out/
@@ -35,13 +53,13 @@ link() {
 # x264 at fixed quality spends bits on noise, so a numerics regression inflates the file even when
 # the eye is unsure. BF16 ref2va 768p is ~466 kbps; the broken arm was 2421 kbps (5.2x).
 bitrate() {
-  docker exec h3 ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate \
-    -of csv=p=0 "/out/$1.mp4" 2>/dev/null | awk '{printf "%dk", $1/1000}'
+  FF ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate \
+    -of csv=p=0 "$(P "$1")" 2>/dev/null | awk '{printf "%dk", $1/1000}'
 }
 
 motion() {
-  docker exec h3 ffprobe -f lavfi \
-    "movie=/out/$1.mp4,tblend=all_mode=difference,signalstats" \
+  FF ffprobe -f lavfi \
+    "movie=$(P "$1"),tblend=all_mode=difference,signalstats" \
     -show_entries frame_tags=lavfi.signalstats.YAVG -of csv=p=0 2>/dev/null \
     | awk -F, 'NF&&$1!=""{s+=$1;n++} END{if(n)printf "%.4f",s/n; else print "n/a"}'
 }
@@ -57,7 +75,7 @@ for CAND in "$@"; do
   # silently swallows it and the check reports nothing; and the line reads
   # "SSIM Y:0.99 (18.3) U:... All:0.99 (19.3)", so a contiguous "Y:.. U:.. V:.. All:.." pattern
   # never matches either.
-  s=$(docker exec h3 ffmpeg -hide_banner -i "/out/$CAND.mp4" -i "/out/$REF.mp4" \
+  s=$(FF ffmpeg -hide_banner -i "$(P "$CAND")" -i "$(P "$REF")" \
         -lavfi "[0:v][1:v]ssim" -f null - 2>&1 | grep -o "SSIM .*")
   echo "cand $CAND   motion=$(motion "$CAND")   bitrate=$(bitrate "$CAND")   $s"
 done
