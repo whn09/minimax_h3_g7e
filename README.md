@@ -39,6 +39,10 @@
 | fl2va，2 卡 Ulysses=2 | 14.968 s | 16.353 s | 47.444 s | 52.023 s |
 | ref2va（参考短边 1024），2 卡 Ulysses=2 | 15.716 s | 18.655 s | 48.733 s | 57.264 s |
 | 对同口径 base 的倍数（4 个配置的范围） | 1.64–1.83× | 2.18–2.27× | 1.62–1.63× | 2.06–2.22× |
+| **再换 Turbo LoRA 蒸馏权重，8 步（最省档，有损）** | 480p/8 | | 768p/8 | |
+| fl2va，1 卡 | 14.581 s | | 47.315 s | |
+| fl2va，1 卡 + Cache-DiT `RDT=0.24` | **11.882 s** | | **36.400 s** | |
+| 对同分辨率 stock 20 步的倍数 | 2.14× / **2.62×** | | 2.41× / **3.14×** | |
 
 请求口径：`short_edge` 480/768 + `aspect 16:9`、`duration 5.0`（5.175 s 成片、124 帧、24 fps）、
 `flow_shift 12.0`、`audio_flow_shift 3.0`、固定 seed。**加卡只在 768p 划得来**，见「加卡」一节。
@@ -47,6 +51,8 @@
 所以不进默认交付配置，单独列出来给「愿意用画质换成本」的场景；它需要 sglang ≥ `c0b6474`
 （旧版本 H3 的 residual 读出来是 0），档位是 480p `RDT=0.20` / 768p `RDT=0.16`，
 画质数字、等成本对照（对减步数）和 $/成片秒都在「Cache-DiT」一节。
+最后一块换的是**权重本身**（Turbo LoRA 蒸馏，8 步），损得比 Cache-DiT 多一点但省得也多，
+见「Turbo LoRA」一节。
 ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`），与早先用的第三方文件运行时
 逐 MiB、逐 0.004 s 相同，见 §3.5。
 
@@ -110,6 +116,8 @@ ref2va 两行的 NVFP4 权重现在是**我们自己转的**（`g7e_quant.sh`）
 | `g7e_ref_edge_sweep.sh` | 扫 ref2va 的参考图短边（1024/768/512），**有损**方向，跑完自动对画质 |
 | `g7e_dev_levers.sh` | 在最新 sglang（`:dev`）上做旋钮消融（Cache-DiT / adaln），另起容器 `h3n`，见「最新 sglang」一节 |
 | `queue_tabfill.sh` | 用上面那个把 Cache-DiT 推荐档在 4 个配置（fl2va/ref2va × 1/2 卡）上量齐，每组 base 与 cache 同 session |
+| `lora_merge_transformer.py` | 把 Turbo LoRA **离线**合进 bf16 transformer（259/259 模块必须全命中），再走同一套 NVFP4 量化，见「Turbo LoRA」一节 |
+| `g7e_turbo.sh` | Turbo LoRA 那一轮的四个 phase：stock 参考 / 步数曲线 / 低 RDT（不触发）/ 高 RDT 扫描 |
 | `g7e_ref2va_provenance.sh` | 判定 ref2va 的 NVFP4 该用谁转的：自量化 / 第三方+canonicalize / BF16 真值三条腿，见 §3.5 |
 | `pull_results_loop.sh` | 在笔记本上边跑边拉结果（spot 会被回收，别等跑完再拉） |
 
@@ -569,6 +577,92 @@ adaln_proj 是 BF16 口径，NVFP4 下这部分本来就量化过，省不到那
 --attention-backend sage_attn \
 --component-attention-backends text_encoder=torch_sdpa,audio_vae=torch_sdpa,video_vae=torch_sdpa
 ```
+
+## Turbo LoRA（8 步蒸馏权重，最省档）
+
+[`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) 的
+`minimax_h3_turbo_v4_step600_ema.safetensors`（strength 1.0，模型卡说 4–8 步可用、8 步最好）。
+**NVFP4 / sage / Cache-DiT 三个都能叠**，因为我们不走运行时 LoRA 而是**离线合并**。
+
+### 关键做法：离线 bf16 合并，再走原来那套量化
+
+`--lora-path` 那条路在量化权重上是死的：运行时"合并式" LoRA 按 `[out, in]` 做 in-place add
+（`runtime/layers/lora/linear.py:243`），而 fp8 把权重转置存（fc1 直接报 `21504 vs 5376`）、
+NVFP4 是 `[N, K/2]` 的 packed e2m1 + 块标度，形状永远对不上。`--lora-merge-mode dynamic` 能跑，
+但只快 3%、SSIM 0.9346 跌破 2 卡重跑地板 0.9444。
+
+所以先在 bf16 上合并（`scripts/lora_merge_transformer.py`），再拿合并后的目录走 §3.5 同一个
+`nvfp4_quantize_transformer.py`。**LoRA 的键名与 diffusers checkpoint 1:1 对得上**，不需要任何映射：
+`blocks.N.attn.qkv_proj` / `mlp.fc{1,2}` / `adaln_proj.linear` / `token_refiner.blocks.N.*` /
+`final_layer.adaln_proj.linear`，共 259 个模块（518 张量）。`W_eff = W + strength·(B@A)`，
+alpha = rank ⇒ 没有额外缩放。合并脚本对"有一个模块没命中"直接 exit 1，不静默少合。
+
+```bash
+curl -sL -o /opt/dlami/nvme/out/lora/minimax_h3_turbo_v4_step600_ema.safetensors \
+  https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora/resolve/main/minimax_h3_turbo_v4_step600_ema.safetensors
+docker exec -e SRC=/models/MiniMax-H3/FL2VA/transformer \
+  -e LORA=/out/lora/minimax_h3_turbo_v4_step600_ema.safetensors \
+  -e DST=/out/turbo_v4_600_bf16 h3n python3 /tmp/lora_merge_transformer.py
+#   → merged 259/259 modules, 最大 |delta|/|W| = 0.0036
+docker exec -e SRC=/out/turbo_v4_600_bf16 -e DST=/out/nvfp4_fl2va_turbo.safetensors \
+  h3n python3 /tmp/nvfp4_quantize_transformer.py
+#   → 951 tensors (q=208 fp8=50 copy=277) worst rel=0.0951（stock 是 0.094x，同量级）
+```
+
+合并完它就是一份普通 NVFP4 checkpoint，serve 命令与 §4 完全一样，只换 `--transformer-weights-path`。
+
+### 实测（单卡 fl2va，参考 = 同轮 stock NVFP4 20 步）
+
+| 臂 | 480p s | 倍数 | $/成片秒 | SSIM Y | motion | 768p s | 倍数 | $/成片秒 | SSIM Y | motion |
+|---|---|---|---|---|---|---|---|---|---|---|
+| stock 20 步（参考） | 31.137 | 1.00× | $0.002991 | — | 0.3439 | 114.155 | 1.00× | $0.010967 | — | 0.4372 |
+| turbo 4 步 | 9.069 | 3.43× | $0.000871 | 0.8742 | 0.3704 | 25.086 | 4.55× | $0.002410 | 0.8531 | 0.4207 |
+| turbo 6 步 | 11.826 | 2.63× | $0.001136 | 0.8867 | 0.3694 | 36.245 | 3.15× | $0.003482 | 0.8695 | 0.4286 |
+| turbo 8 步 | 14.581 | 2.14× | $0.001401 | 0.9027 | 0.3558 | 47.315 | 2.41× | $0.004546 | 0.8839 | 0.5193 |
+| **8 步 + cache `RDT=0.24` `W=2`** | **11.882** | **2.62×** | **$0.001142** | **0.9034** | 0.3636 | **36.400** | **3.14×** | **$0.003497** | **0.8848** | 0.4385 |
+| 8 步 + cache `RDT=0.32` | 10.543 | 2.95× | $0.001013 | 0.8836 | 0.3688 | 31.001 | 3.68× | $0.002978 | 0.8606 | 0.4398 |
+
+**768p 全叠之后的单位成本 = 以前 480p/20 步的成本**（$0.002978 vs $0.002991）。
+turbo 单独用就已经比之前最好的加速档（20 步 + Cache-DiT，768p $0.006755）再省 33%，叠 R24 省 48%。
+
+推荐 **8 步 + `RDT=0.24`**，不推荐 R32：再快 17%，但 768p SSIM 从 0.8848 掉到 0.8606，
+掉出 Cache-DiT 交付档 ~0.92 那个量级。
+
+### 画质怎么读（三条）
+
+1. **SSIM 0.88–0.90 是"另一条轨迹"不是"差 10%"。** 同口径对照：stock 自己减到 10 步是
+   480p 0.9141 / 768p 0.8999，turbo 8 步与它同量级但**快 19% / 23%**（17.375→14.581、
+   58.281→47.315 s）。
+2. **没有蒸馏塌运动**：turbo 的运动能量一律 ≥ stock（480p 0.3558 vs 0.3439、768p 0.5193 vs 0.4372）。
+   蒸馏失败的签名恰恰是运动塌掉、SSIM 反升。抽四帧看 768p 那条，是同一个连贯运镜、幅度略大，
+   没有闪烁。
+3. **叠 cache 反而把 SSIM 拉回来一点**（480p 0.9027→0.9034、768p 0.8839→0.8848）：cache 复用早期
+   residual = 往前面的轨迹拉，把 turbo 冲过头的运动收回到 stock 附近（0.5193→0.4385）。
+   所以"更快 + 画质微升"不矛盾。
+
+### Cache-DiT 的阈值必须重调（这是本轮唯一的坑）
+
+stock 上定的档（480p `RDT=0.20` / 768p `0.16`）在 8 步上**整个偏低**：
+
+- `RDT=0.16` 在 8 步下**一次都不触发**，输出与 base 逐格相同（SSIM 1.000000），把 warmup 从默认 4
+  收到 2 也不救。步数少 → 每步 residual 变化大 → 阈值要往上走。turbo 8 步的膝点是 **0.24**。
+- **warmup 一定要一起调**：默认 `W=4` 意味着 8 步里头 4 步必算，只剩 4 步可跳，再叠 `MC=3`
+  限制连跳 ⇒ 默认档等于半残。这轮一律 `SGLANG_CACHE_DIT_WARMUP=2`（连 `_SECONDARY_WARMUP`）。
+- `RDT` 的平台效应照旧：480p 上 `0.28` 与 `0.24` 输出**逐位相同**，别报成两档。
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=1 \
+SGLANG_CACHE_DIT_WARMUP=2 SGLANG_CACHE_DIT_SECONDARY_WARMUP=2 \
+SGLANG_CACHE_DIT_RDT=0.24 SGLANG_CACHE_DIT_SECONDARY_RDT=0.24
+```
+
+### 复现性
+
+turbo 8 步 base 跨 3 个 arm、跨 server 重启量了 3 次：480p 14.597 / 14.575 / 14.571（散布 0.18%）、
+768p 47.400 / 47.264 / 47.280（0.29%），三份 mp4 的 md5 完全相同 ⇒ 单卡逐位可复现在 turbo 权重上
+照旧成立（SSIM 地板 = 1.0）。同轮 stock 20 步与上面交付表差 0.15–0.3%，两张表可并列。
+
+跑法：`PHASES="tb0 tbo tbc tbc2" ./g7e_turbo.sh`（四个 phase 一个 TAG，别共用 TAG，同名 mp4 会静默覆盖）。
 
 ## sglang 的并行旋钮（源码核对 + 实测）
 

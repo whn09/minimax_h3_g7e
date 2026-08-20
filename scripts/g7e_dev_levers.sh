@@ -118,6 +118,12 @@ for arm in $ARMS; do
     # 真正的性价比曲线，所以要扫。
     cacheR*) ENVX="$ENVX SGLANG_CACHE_DIT_ENABLED=1 SGLANG_CACHE_DIT_RDT=0.${KNOB#cacheR} \
                    SGLANG_CACHE_DIT_SECONDARY_RDT=0.${KNOB#cacheR}" ;;
+    # cacheW<N>R<MM> = warmup N + RDT 0.MM。**步数少的时候必须调 warmup**：默认 W=4 意味着头 4 步
+    # 一定全算，turbo 的 8 步就只剩 4 步可跳（MC=3 还限制连跳），默认档等于半残。
+    cacheW*R*) w=${KNOB#cacheW}; w=${w%%R*}; r=${KNOB##*R}
+             ENVX="$ENVX SGLANG_CACHE_DIT_ENABLED=1 \
+                   SGLANG_CACHE_DIT_WARMUP=$w SGLANG_CACHE_DIT_SECONDARY_WARMUP=$w \
+                   SGLANG_CACHE_DIT_RDT=0.$r SGLANG_CACHE_DIT_SECONDARY_RDT=0.$r" ;;
     adaln)   EXTRA="$EXTRA --minimax-h3-adaln-online --minimax-h3-adaln-plan-width 3" ;;
     *) echo "SKIP unknown knob '$KNOB'"; continue ;;
   esac
